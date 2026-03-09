@@ -4,6 +4,9 @@
 *.log
 * ONNX files
 *.onnx
+DATA/
+models/
+
 
 # IDE files
 .idea/
