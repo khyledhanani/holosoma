@@ -15,7 +15,7 @@ import logging
 import os
 import sys
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from copy import deepcopy
@@ -207,11 +207,40 @@ def _run_single_agent_retarget(
     return np.asarray(qpos, dtype=np.float32)
 
 
-def _prefix_names_in_subtree(elem: ET.Element, prefix: str) -> None:
+def _prefix_attributes_in_subtree(elem: ET.Element, prefix: str, attrs: tuple[str, ...]) -> None:
     for node in elem.iter():
-        for attr in ("name", "joint", "body", "geom", "site", "tendon"):
+        for attr in attrs:
             if attr in node.attrib:
                 node.set(attr, prefix + node.attrib[attr])
+
+
+def _prefix_names_in_subtree(elem: ET.Element, prefix: str) -> None:
+    _prefix_attributes_in_subtree(elem, prefix, ("name", "joint", "body", "geom", "site", "tendon"))
+
+
+def _duplicate_and_prefix_section(
+    root: ET.Element,
+    section_tag: str,
+    prefix_a: str,
+    prefix_b: str,
+    attrs_to_prefix: tuple[str, ...],
+) -> None:
+    section = root.find(section_tag)
+    if section is None:
+        return
+
+    original_children = list(section)
+    if not original_children:
+        return
+
+    for child in original_children:
+        section.remove(child)
+
+    for prefix in (prefix_a, prefix_b):
+        for child in original_children:
+            child_copy = deepcopy(child)
+            _prefix_attributes_in_subtree(child_copy, prefix, attrs_to_prefix)
+            section.append(child_copy)
 
 
 def _build_dual_scene_xml_from_single(single_xml_path: Path, out_path: Path, prefix_a: str, prefix_b: str) -> Path:
@@ -219,7 +248,20 @@ def _build_dual_scene_xml_from_single(single_xml_path: Path, out_path: Path, pre
     root = tree.getroot()
     compiler = root.find("compiler")
     if compiler is not None:
-        meshdir_abs = (single_xml_path.parent / "assets").resolve()
+        meshdir = compiler.get("meshdir")
+        if meshdir:
+            meshdir_abs = Path(meshdir)
+            if not meshdir_abs.is_absolute():
+                meshdir_abs = (single_xml_path.parent / meshdir_abs).resolve()
+        else:
+            assets_dir = single_xml_path.parent / "assets"
+            meshes_dir = single_xml_path.parent / "meshes"
+            if assets_dir.exists():
+                meshdir_abs = assets_dir.resolve()
+            elif meshes_dir.exists():
+                meshdir_abs = meshes_dir.resolve()
+            else:
+                meshdir_abs = single_xml_path.parent.resolve()
         compiler.set("meshdir", str(meshdir_abs) + "/")
     worldbody = root.find("worldbody")
     if worldbody is None:
@@ -241,6 +283,38 @@ def _build_dual_scene_xml_from_single(single_xml_path: Path, out_path: Path, pre
 
     worldbody.append(body_a)
     worldbody.append(body_b)
+
+    dual_ref_attrs = (
+        "name",
+        "joint",
+        "joint1",
+        "joint2",
+        "geom",
+        "geom1",
+        "geom2",
+        "body",
+        "body1",
+        "body2",
+        "site",
+        "site1",
+        "site2",
+        "tendon",
+        "tendon1",
+        "tendon2",
+        "actuator",
+        "objname",
+        "slidersite",
+        "cranksite",
+    )
+    _duplicate_and_prefix_section(root, "sensor", prefix_a, prefix_b, dual_ref_attrs)
+    _duplicate_and_prefix_section(root, "actuator", prefix_a, prefix_b, dual_ref_attrs)
+    _duplicate_and_prefix_section(root, "tendon", prefix_a, prefix_b, dual_ref_attrs)
+    _duplicate_and_prefix_section(root, "equality", prefix_a, prefix_b, dual_ref_attrs)
+    _duplicate_and_prefix_section(root, "contact", prefix_a, prefix_b, dual_ref_attrs)
+
+    keyframe = root.find("keyframe")
+    if keyframe is not None:
+        root.remove(keyframe)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tree.write(str(out_path), encoding="utf-8", xml_declaration=False)
@@ -289,11 +363,23 @@ def _resolve_asset_paths(constants: SimpleNamespace, asset_root: Path) -> None:
         constants.SCENE_XML_FILE = _to_abs(getattr(constants, "SCENE_XML_FILE", None))
 
 
+def _resolve_robot_and_motion_config(
+    cfg: DualRetargetConfig,
+) -> tuple[RobotConfig, MotionDataConfig]:
+    """Align nested configs with top-level robot/data format while preserving overrides."""
+    robot_config = cfg.robot_config
+    if robot_config.robot_type != cfg.robot:
+        robot_config = replace(robot_config, robot_type=cfg.robot)
+
+    motion_data_config = cfg.motion_data_config
+    if motion_data_config.robot_type != cfg.robot or motion_data_config.data_format != cfg.data_format:
+        motion_data_config = replace(motion_data_config, robot_type=cfg.robot, data_format=cfg.data_format)
+
+    return robot_config, motion_data_config
+
+
 def main(cfg: DualRetargetConfig) -> None:
-    if cfg.robot_config.robot_type != cfg.robot:
-        cfg.robot_config = RobotConfig(robot_type=cfg.robot)
-    if cfg.motion_data_config.robot_type != cfg.robot or cfg.motion_data_config.data_format != cfg.data_format:
-        cfg.motion_data_config = MotionDataConfig(data_format=cfg.data_format, robot_type=cfg.robot)
+    robot_config, motion_data_config = _resolve_robot_and_motion_config(cfg)
 
     sequence_file = _pick_sequence_file(cfg.data_dir, cfg.sequence_id)
     sequence_id, fps, human_a, human_b, height_a, height_b = _load_dual_sequence(sequence_file)
@@ -311,8 +397,8 @@ def main(cfg: DualRetargetConfig) -> None:
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     task_constants = create_task_constants(
-        robot_config=cfg.robot_config,
-        motion_data_config=cfg.motion_data_config,
+        robot_config=robot_config,
+        motion_data_config=motion_data_config,
         task_config=cfg.task_config,
         task_type="robot_only",
     )
@@ -339,8 +425,8 @@ def main(cfg: DualRetargetConfig) -> None:
         human_joints_B=human_b,
         height_A=height_a,
         height_B=height_b,
-        robot=cfg.robot,
-        data_format=cfg.data_format,
+        robot=robot_config.robot_type,
+        data_format=motion_data_config.data_format,
     )
     logger.info("Saved Part-1 prepared inputs: %s", prepared_out)
 
@@ -353,7 +439,7 @@ def main(cfg: DualRetargetConfig) -> None:
 
     scale_a = task_constants.ROBOT_HEIGHT / height_a
     scale_b = task_constants.ROBOT_HEIGHT / height_b
-    toe_names = cfg.motion_data_config.toe_names
+    toe_names = motion_data_config.toe_names
 
     if cfg.coupled_dual:
         robot_xml_single = Path(str(task_constants.ROBOT_URDF_FILE).replace(".urdf", ".xml"))
