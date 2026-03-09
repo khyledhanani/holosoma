@@ -76,6 +76,9 @@ class DualRetargetConfig:
     coupled_dual: bool = False
     """If True, run coupled dual optimization via DualInteractionMeshRetargeter."""
 
+    coupled_warm_start_nominal: bool = True
+    """If True, run independent A/B retarget first and use outputs for coupled warm-start + nominal tracking."""
+
     dual_scene_xml: Path | None = None
     """Optional prebuilt dual scene XML path. If None and coupled_dual=True, auto-generate one."""
 
@@ -188,6 +191,33 @@ def _run_single_agent_retarget(
         retargeter.demo_joints,
         toe_names,
     )
+    return _run_single_agent_retarget_processed(
+        human_processed=human_processed,
+        foot_sticking_sequences=foot_sticking_sequences,
+        constants=constants,
+        retargeter_cfg=retargeter_cfg,
+        object_local_pts=object_local_pts,
+        object_local_pts_demo=object_local_pts_demo,
+        out_path=out_path,
+    )
+
+
+def _run_single_agent_retarget_processed(
+    human_processed: np.ndarray,
+    foot_sticking_sequences: list[dict[str, bool]],
+    constants: SimpleNamespace,
+    retargeter_cfg: RetargeterConfig,
+    object_local_pts: np.ndarray,
+    object_local_pts_demo: np.ndarray,
+    out_path: Path,
+) -> np.ndarray:
+    retargeter_kwargs = build_retargeter_kwargs_from_config(
+        retargeter_config=retargeter_cfg,
+        constants=constants,
+        object_urdf_path=None,
+        task_type="robot_only",
+    )
+    retargeter = InteractionMeshRetargeter(**retargeter_kwargs)
 
     object_poses = _identity_object_poses(human_processed.shape[0])
     q_init = _build_q_init(human_processed, constants.ROBOT_DOF)
@@ -464,8 +494,56 @@ def main(cfg: DualRetargetConfig) -> None:
             toe_names=toe_names,
             demo_joints=list(task_constants.DEMO_JOINTS),
         )
-        q_init_a = _build_q_init(human_a_processed, task_constants.ROBOT_DOF)
-        q_init_b = _build_q_init(human_b_processed, task_constants.ROBOT_DOF)
+
+        q_nominal_a: np.ndarray | None = None
+        q_nominal_b: np.ndarray | None = None
+        if cfg.coupled_warm_start_nominal:
+            warm_a_path = cfg.output_dir / f"{sequence_id}_A_coupled_warmstart.npz"
+            warm_b_path = cfg.output_dir / f"{sequence_id}_B_coupled_warmstart.npz"
+            logger.info("Running independent warm-start retargeting for A...")
+            q_nominal_a = _run_single_agent_retarget_processed(
+                human_processed=human_a_processed,
+                foot_sticking_sequences=foot_a,
+                constants=task_constants,
+                retargeter_cfg=cfg.retargeter,
+                object_local_pts=object_local_pts,
+                object_local_pts_demo=object_local_pts_demo,
+                out_path=warm_a_path,
+            )
+            logger.info("Running independent warm-start retargeting for B...")
+            q_nominal_b = _run_single_agent_retarget_processed(
+                human_processed=human_b_processed,
+                foot_sticking_sequences=foot_b,
+                constants=task_constants,
+                retargeter_cfg=cfg.retargeter,
+                object_local_pts=object_local_pts,
+                object_local_pts_demo=object_local_pts_demo,
+                out_path=warm_b_path,
+            )
+
+            n_shared = min(
+                human_a_processed.shape[0],
+                human_b_processed.shape[0],
+                q_nominal_a.shape[0],
+                q_nominal_b.shape[0],
+            )
+            if n_shared < human_a_processed.shape[0]:
+                logger.warning(
+                    "Truncating coupled solve to %d frames due to warm-start length mismatch.",
+                    n_shared,
+                )
+            human_a_processed = human_a_processed[:n_shared]
+            human_b_processed = human_b_processed[:n_shared]
+            foot_a = foot_a[:n_shared]
+            foot_b = foot_b[:n_shared]
+            q_nominal_a = q_nominal_a[:n_shared]
+            q_nominal_b = q_nominal_b[:n_shared]
+
+            q_init_a = np.asarray(q_nominal_a[0], dtype=np.float32)
+            q_init_b = np.asarray(q_nominal_b[0], dtype=np.float32)
+        else:
+            q_init_a = _build_q_init(human_a_processed, task_constants.ROBOT_DOF)
+            q_init_b = _build_q_init(human_b_processed, task_constants.ROBOT_DOF)
 
         dual_retargeter = DualInteractionMeshRetargeter(
             task_constants=task_constants,
@@ -485,6 +563,8 @@ def main(cfg: DualRetargetConfig) -> None:
             whitelist_margin=-0.015,
             ab_top_k_pairs=24,
             contact_slack_weight=300.0,
+            w_nominal_tracking_init=cfg.retargeter.w_nominal_tracking_init,
+            nominal_tracking_tau=cfg.retargeter.nominal_tracking_tau,
             debug=cfg.retargeter.debug,
         )
         logger.info("Running coupled dual retargeting for A+B...")
@@ -493,6 +573,8 @@ def main(cfg: DualRetargetConfig) -> None:
             human_joint_motions_b=human_b_processed,
             foot_sticking_sequences_a=foot_a,
             foot_sticking_sequences_b=foot_b,
+            q_nominal_motions_a=q_nominal_a,
+            q_nominal_motions_b=q_nominal_b,
             q_init_a=q_init_a,
             q_init_b=q_init_b,
             dest_res_path=str(cfg.output_dir / f"{sequence_id}_dual_coupled_raw.npz"),

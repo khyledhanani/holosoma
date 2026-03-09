@@ -62,6 +62,8 @@ class DualInteractionMeshRetargeter:
         whitelist_margin: float = -0.015,
         ab_top_k_pairs: int = 24,
         contact_slack_weight: float = 300.0,
+        w_nominal_tracking_init: float = 0.0,
+        nominal_tracking_tau: float = 1e6,
         max_source_edge_len: float = 0.45,
         cross_agent_rescue_k: int = 3,
         ab_pair_whitelist: set[tuple[str, str]] | None = None,
@@ -88,6 +90,8 @@ class DualInteractionMeshRetargeter:
         self.whitelist_margin = whitelist_margin
         self.ab_top_k_pairs = ab_top_k_pairs
         self.contact_slack_weight = contact_slack_weight
+        self.w_nominal_tracking_init = float(w_nominal_tracking_init)
+        self.nominal_tracking_tau = float(nominal_tracking_tau)
 
         self.max_source_edge_len = max_source_edge_len
         self.cross_agent_rescue_k = cross_agent_rescue_k
@@ -140,6 +144,8 @@ class DualInteractionMeshRetargeter:
         start_local_b = 7 + self.q_b_init_idx
         if start_local_a < 0 or start_local_b < 0:
             raise ValueError("q_*_init_idx must be >= -7.")
+        self.start_local_a = int(start_local_a)
+        self.start_local_b = int(start_local_b)
 
         self.q_a_indices = self.q_block_a[start_local_a:]
         self.q_b_indices = self.q_block_b[start_local_b:]
@@ -243,6 +249,10 @@ class DualInteractionMeshRetargeter:
                 self.laplacian_weights[i] = 2.5
                 self.laplacian_weights[i + self.num_source_per_agent] = 2.5
 
+        nominal_indices = np.asarray(getattr(self.task_constants, "NOMINAL_TRACKING_INDICES", []), dtype=int)
+        self.track_nominal_indices_a = self._project_nominal_indices(nominal_indices, self.start_local_a, self.nq_a)
+        self.track_nominal_indices_b = self._project_nominal_indices(nominal_indices, self.start_local_b, self.nq_b)
+
     # --------------------------------------------------------------------------
     # Public API
     # --------------------------------------------------------------------------
@@ -252,6 +262,8 @@ class DualInteractionMeshRetargeter:
         human_joint_motions_b: np.ndarray,
         foot_sticking_sequences_a: list[dict[str, bool]] | None = None,
         foot_sticking_sequences_b: list[dict[str, bool]] | None = None,
+        q_nominal_motions_a: np.ndarray | None = None,
+        q_nominal_motions_b: np.ndarray | None = None,
         q_init_a: np.ndarray | None = None,
         q_init_b: np.ndarray | None = None,
         dest_res_path: str | None = None,
@@ -263,6 +275,8 @@ class DualInteractionMeshRetargeter:
             human_joint_motions_b: (T, 22, 3) SMPL-X joints for person B.
             foot_sticking_sequences_a: length-T flags for A.
             foot_sticking_sequences_b: length-T flags for B.
+            q_nominal_motions_a: optional per-frame nominal states for A.
+            q_nominal_motions_b: optional per-frame nominal states for B.
             q_init_a: optional local robot state for A in MuJoCo order [xyz, wxyz, joints].
             q_init_b: optional local robot state for B in MuJoCo order [xyz, wxyz, joints].
             dest_res_path: optional output npz path.
@@ -282,6 +296,8 @@ class DualInteractionMeshRetargeter:
 
         foot_sticking_sequences_a = self._normalize_foot_sequence(foot_sticking_sequences_a, num_frames)
         foot_sticking_sequences_b = self._normalize_foot_sequence(foot_sticking_sequences_b, num_frames)
+        q_nominal_motions_a = self._normalize_nominal_sequence(q_nominal_motions_a, num_frames, agent="A")
+        q_nominal_motions_b = self._normalize_nominal_sequence(q_nominal_motions_b, num_frames, agent="B")
 
         q = np.copy(self.robot_data.qpos)
         if q_init_a is not None:
@@ -304,6 +320,7 @@ class DualInteractionMeshRetargeter:
                 )
                 _, adj_list, target_laplacian = self._build_source_graph(source_vertices)
                 n_iter = self.n_iter_first if t == 0 else self.n_iter_other
+                w_nominal_tracking = self._nominal_weight_for_frame(t)
 
                 q, cost = self.iterate(
                     q_n=q,
@@ -313,6 +330,9 @@ class DualInteractionMeshRetargeter:
                     target_laplacian=target_laplacian,
                     foot_sticking_a=foot_sticking_sequences_a[t],
                     foot_sticking_b=foot_sticking_sequences_b[t],
+                    q_nominal_a=(q_nominal_motions_a[t] if q_nominal_motions_a is not None else None),
+                    q_nominal_b=(q_nominal_motions_b[t] if q_nominal_motions_b is not None else None),
+                    w_nominal_tracking=w_nominal_tracking,
                     n_iter=n_iter,
                     init_t=(t == 0),
                 )
@@ -348,6 +368,9 @@ class DualInteractionMeshRetargeter:
         target_laplacian: np.ndarray,
         foot_sticking_a: dict[str, bool],
         foot_sticking_b: dict[str, bool],
+        q_nominal_a: np.ndarray | None,
+        q_nominal_b: np.ndarray | None,
+        w_nominal_tracking: float,
         *,
         n_iter: int,
         init_t: bool,
@@ -363,6 +386,9 @@ class DualInteractionMeshRetargeter:
                 target_laplacian=target_laplacian,
                 foot_sticking_a=foot_sticking_a,
                 foot_sticking_b=foot_sticking_b,
+                q_nominal_a=q_nominal_a,
+                q_nominal_b=q_nominal_b,
+                w_nominal_tracking=w_nominal_tracking,
                 init_t=init_t,
             )
             if np.isclose(cost, last_cost):
@@ -380,6 +406,9 @@ class DualInteractionMeshRetargeter:
         target_laplacian: np.ndarray,
         foot_sticking_a: dict[str, bool],
         foot_sticking_b: dict[str, bool],
+        q_nominal_a: np.ndarray | None,
+        q_nominal_b: np.ndarray | None,
+        w_nominal_tracking: float,
         init_t: bool,
         verbose: bool = False,
     ) -> tuple[np.ndarray, float]:
@@ -431,6 +460,15 @@ class DualInteractionMeshRetargeter:
 
         q_a_n = q_curr[self.q_a_indices]
         q_b_n = q_curr[self.q_b_indices]
+        if (w_nominal_tracking > 0.0) and (q_nominal_a is not None) and (self.track_nominal_indices_a.size > 0):
+            idx = self.track_nominal_indices_a
+            za = dqa[idx] - (q_nominal_a[idx] - q_a_n[idx])
+            obj_terms.append(w_nominal_tracking * cp.sum_squares(za))
+        if (w_nominal_tracking > 0.0) and (q_nominal_b is not None) and (self.track_nominal_indices_b.size > 0):
+            idx = self.track_nominal_indices_b
+            zb = dqb[idx] - (q_nominal_b[idx] - q_b_n[idx])
+            obj_terms.append(w_nominal_tracking * cp.sum_squares(zb))
+
         obj_terms.append(cp.sum_squares(cp.multiply(np.sqrt(self.Q_diag_a), dqa + q_a_n)))
         obj_terms.append(cp.sum_squares(cp.multiply(np.sqrt(self.Q_diag_b), dqb + q_b_n)))
 
@@ -637,6 +675,51 @@ class DualInteractionMeshRetargeter:
         if len(seq) != n_frames:
             raise ValueError(f"Foot sticking sequence length {len(seq)} != n_frames {n_frames}")
         return seq
+
+    def _normalize_nominal_sequence(
+        self,
+        seq: np.ndarray | None,
+        n_frames: int,
+        *,
+        agent: str,
+    ) -> np.ndarray | None:
+        if seq is None:
+            return None
+        arr = np.asarray(seq, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] != n_frames:
+            raise ValueError(f"Nominal sequence for agent {agent} must have shape (T, D) with T={n_frames}, got {arr.shape}")
+
+        expected_local = 7 + self.robot_dof
+        if agent == "A":
+            expected_opt = self.nq_a
+            start_local = self.start_local_a
+        else:
+            expected_opt = self.nq_b
+            start_local = self.start_local_b
+
+        if arr.shape[1] == expected_opt:
+            return np.asarray(arr, dtype=float)
+        if arr.shape[1] >= expected_local:
+            end = start_local + expected_opt
+            return np.asarray(arr[:, start_local:end], dtype=float)
+
+        raise ValueError(
+            f"Nominal sequence width for agent {agent} must be {expected_opt} (opt slice) "
+            f"or >= {expected_local} (full local state), got {arr.shape[1]}"
+        )
+
+    def _nominal_weight_for_frame(self, frame_idx: int) -> float:
+        if self.w_nominal_tracking_init <= 0.0:
+            return 0.0
+        tau = max(self.nominal_tracking_tau, 1e-9)
+        return float(self.w_nominal_tracking_init * np.exp(-float(frame_idx) / tau))
+
+    @staticmethod
+    def _project_nominal_indices(indices: np.ndarray, start_local: int, nq_local: int) -> np.ndarray:
+        if indices.size == 0:
+            return np.array([], dtype=int)
+        mask = (indices >= start_local) & (indices < (start_local + nq_local))
+        return (indices[mask] - start_local).astype(int)
 
     # --------------------------------------------------------------------------
     # Contact constraints
