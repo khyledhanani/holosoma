@@ -51,6 +51,58 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def _build_dual_dense_joint_mapping(
+    *,
+    constants: SimpleNamespace,
+    robot_type: str,
+) -> dict[str, str | tuple[str, np.ndarray]]:
+    mapping = deepcopy(dict(constants.JOINTS_MAPPING))
+
+    if robot_type == "g1":
+        mapping.update(
+            {
+                "Spine1": ("pelvis_contour_link", np.array([0.0, 0.0, 0.06], dtype=float)),
+                "Spine2": ("torso_link", np.array([0.0, 0.0, 0.02], dtype=float)),
+                "Spine3": ("torso_link", np.array([0.01, 0.0, 0.14], dtype=float)),
+                "Neck": ("head_link", np.array([0.0, 0.0, -0.04], dtype=float)),
+                "Head": ("head_link", np.array([0.03, 0.0, 0.12], dtype=float)),
+                "L_Collar": ("left_shoulder_pitch_link", np.array([0.0, 0.02, 0.02], dtype=float)),
+                "R_Collar": ("right_shoulder_pitch_link", np.array([0.0, -0.02, 0.02], dtype=float)),
+                "L_Wrist": ("left_rubber_hand_link", np.array([0.03, 0.0, 0.0], dtype=float)),
+                "R_Wrist": ("right_rubber_hand_link", np.array([0.03, 0.0, 0.0], dtype=float)),
+                "L_Foot": ("left_ankle_roll_sphere_5_link", np.array([0.02, 0.0, 0.0], dtype=float)),
+                "R_Foot": ("right_ankle_roll_sphere_5_link", np.array([0.02, 0.0, 0.0], dtype=float)),
+            }
+        )
+        return mapping
+
+    if robot_type == "t1":
+        mapping.update(
+            {
+                "Spine1": ("Waist", np.array([0.0, 0.0, 0.06], dtype=float)),
+                "Spine2": ("Trunk", np.array([0.03, 0.0, 0.03], dtype=float)),
+                "Spine3": ("Trunk", np.array([0.05, 0.0, 0.16], dtype=float)),
+                "Neck": ("H1", np.array([0.0, 0.0, 0.02], dtype=float)),
+                "Head": ("H2", np.array([0.02, 0.0, 0.08], dtype=float)),
+                "L_Collar": ("AL1", np.array([0.0, 0.02, 0.02], dtype=float)),
+                "R_Collar": ("AR1", np.array([0.0, -0.02, 0.02], dtype=float)),
+                "L_Wrist": ("left_hand_sphere_link", np.array([0.03, 0.0, 0.0], dtype=float)),
+                "R_Wrist": ("right_hand_sphere_link", np.array([0.03, 0.0, 0.0], dtype=float)),
+                "L_Foot": ("left_foot_sphere_5_link", np.array([0.03, 0.0, 0.0], dtype=float)),
+                "R_Foot": ("right_foot_sphere_5_link", np.array([0.03, 0.0, 0.0], dtype=float)),
+            }
+        )
+        return mapping
+
+    return mapping
+
+
+def _make_dual_dense_task_constants(constants: SimpleNamespace, robot_type: str) -> SimpleNamespace:
+    dense_constants = deepcopy(constants)
+    dense_constants.JOINTS_MAPPING = _build_dual_dense_joint_mapping(constants=constants, robot_type=robot_type)
+    return dense_constants
+
+
 @dataclass
 class DualRetargetConfig:
     """Config for dual-robot retargeting Part 1."""
@@ -65,7 +117,13 @@ class DualRetargetConfig:
     """Directory for part-1 outputs."""
 
     robot: str = "g1"
-    """Robot type."""
+    """Shared fallback robot type (used for both A/B if agent-specific types are not provided)."""
+
+    robot_a: str | None = None
+    """Optional robot type for agent A (overrides `robot`)."""
+
+    robot_b: str | None = None
+    """Optional robot type for agent B (overrides `robot`)."""
 
     data_format: str = "smplx"
     """Motion data format used for joint naming/mapping."""
@@ -244,110 +302,124 @@ def _prefix_attributes_in_subtree(elem: ET.Element, prefix: str, attrs: tuple[st
                 node.set(attr, prefix + node.attrib[attr])
 
 
-def _prefix_names_in_subtree(elem: ET.Element, prefix: str) -> None:
-    _prefix_attributes_in_subtree(elem, prefix, ("name", "joint", "body", "geom", "site", "tendon"))
+DUAL_XML_REF_ATTRS: tuple[str, ...] = (
+    "name",
+    "class",
+    "childclass",
+    "joint",
+    "joint1",
+    "joint2",
+    "geom",
+    "geom1",
+    "geom2",
+    "body",
+    "body1",
+    "body2",
+    "site",
+    "site1",
+    "site2",
+    "tendon",
+    "tendon1",
+    "tendon2",
+    "actuator",
+    "objname",
+    "mesh",
+    "material",
+    "texture",
+    "hfield",
+    "target",
+    "slidersite",
+    "cranksite",
+)
 
 
-def _duplicate_and_prefix_section(
-    root: ET.Element,
-    section_tag: str,
-    prefix_a: str,
-    prefix_b: str,
-    attrs_to_prefix: tuple[str, ...],
-) -> None:
-    section = root.find(section_tag)
-    if section is None:
-        return
-
-    original_children = list(section)
-    if not original_children:
-        return
-
-    for child in original_children:
-        section.remove(child)
-
-    for prefix in (prefix_a, prefix_b):
-        for child in original_children:
-            child_copy = deepcopy(child)
-            _prefix_attributes_in_subtree(child_copy, prefix, attrs_to_prefix)
-            section.append(child_copy)
+def _resolve_mesh_base_dir(single_xml_path: Path, root: ET.Element) -> Path:
+    compiler = root.find("compiler")
+    meshdir = compiler.get("meshdir") if compiler is not None else None
+    if meshdir:
+        mesh_base = Path(meshdir)
+        if not mesh_base.is_absolute():
+            mesh_base = (single_xml_path.parent / mesh_base).resolve()
+        return mesh_base
+    assets_dir = single_xml_path.parent / "assets"
+    meshes_dir = single_xml_path.parent / "meshes"
+    if assets_dir.exists():
+        return assets_dir.resolve()
+    if meshes_dir.exists():
+        return meshes_dir.resolve()
+    return single_xml_path.parent.resolve()
 
 
-def _build_dual_scene_xml_from_single(single_xml_path: Path, out_path: Path, prefix_a: str, prefix_b: str) -> Path:
+def _absolutize_file_paths(root: ET.Element, single_xml_path: Path) -> None:
+    mesh_base = _resolve_mesh_base_dir(single_xml_path, root)
+    for node in root.iter():
+        file_attr = node.attrib.get("file")
+        if file_attr is None:
+            continue
+        file_path = Path(file_attr)
+        if file_path.is_absolute():
+            continue
+        if node.tag in {"mesh", "texture", "hfield", "heightfield"}:
+            abs_path = (mesh_base / file_path).resolve()
+        else:
+            abs_path = (single_xml_path.parent / file_path).resolve()
+        node.set("file", str(abs_path))
+
+
+def _load_and_prefix_root(single_xml_path: Path, prefix: str) -> ET.Element:
     tree = ET.parse(str(single_xml_path))
     root = tree.getroot()
-    compiler = root.find("compiler")
-    if compiler is not None:
-        meshdir = compiler.get("meshdir")
-        if meshdir:
-            meshdir_abs = Path(meshdir)
-            if not meshdir_abs.is_absolute():
-                meshdir_abs = (single_xml_path.parent / meshdir_abs).resolve()
-        else:
-            assets_dir = single_xml_path.parent / "assets"
-            meshes_dir = single_xml_path.parent / "meshes"
-            if assets_dir.exists():
-                meshdir_abs = assets_dir.resolve()
-            elif meshes_dir.exists():
-                meshdir_abs = meshes_dir.resolve()
-            else:
-                meshdir_abs = single_xml_path.parent.resolve()
-        compiler.set("meshdir", str(meshdir_abs) + "/")
-    worldbody = root.find("worldbody")
+    _absolutize_file_paths(root, single_xml_path)
+    _prefix_attributes_in_subtree(root, prefix, DUAL_XML_REF_ATTRS)
+    return root
+
+
+def _append_section_children(dst_root: ET.Element, src_root: ET.Element, section_tag: str) -> None:
+    src_sections = src_root.findall(section_tag)
+    if not src_sections:
+        return
+    dst_section = dst_root.find(section_tag)
+    if dst_section is None:
+        dst_section = ET.SubElement(dst_root, section_tag)
+    for src_section in src_sections:
+        for child in list(src_section):
+            dst_section.append(deepcopy(child))
+
+
+def _build_dual_scene_xml_from_pair(
+    robot_xml_a: Path,
+    robot_xml_b: Path,
+    out_path: Path,
+    prefix_a: str,
+    prefix_b: str,
+) -> Path:
+    root_a = _load_and_prefix_root(robot_xml_a, prefix_a)
+    root_b = _load_and_prefix_root(robot_xml_b, prefix_b)
+
+    merged_root = ET.Element("mujoco", attrib={"model": f"{prefix_a}{robot_xml_a.stem}__{prefix_b}{robot_xml_b.stem}"})
+
+    # Keep singleton sections from A first, then B as fallback.
+    for singleton_tag in ("compiler", "option", "size", "visual", "statistic"):
+        singleton = root_a.find(singleton_tag) or root_b.find(singleton_tag)
+        if singleton is not None:
+            merged_root.append(deepcopy(singleton))
+
+    for section_tag in ("default", "asset", "worldbody", "sensor", "actuator", "tendon", "equality", "contact"):
+        _append_section_children(merged_root, root_a, section_tag)
+        _append_section_children(merged_root, root_b, section_tag)
+
+    worldbody = merged_root.find("worldbody")
     if worldbody is None:
-        raise ValueError(f"worldbody not found in XML: {single_xml_path}")
+        raise ValueError("Merged dual scene has no worldbody section.")
 
-    robot_bodies = [child for child in list(worldbody) if child.tag == "body" and child.find("freejoint") is not None]
-    if not robot_bodies:
-        raise ValueError(f"No root robot body with freejoint found in XML: {single_xml_path}")
-    if len(robot_bodies) > 1:
-        logger.warning("Found %d root freejoint bodies; using first: %s", len(robot_bodies), robot_bodies[0].get("name"))
-
-    template_body = robot_bodies[0]
-    worldbody.remove(template_body)
-
-    body_a = deepcopy(template_body)
-    body_b = deepcopy(template_body)
-    _prefix_names_in_subtree(body_a, prefix_a)
-    _prefix_names_in_subtree(body_b, prefix_b)
-
-    worldbody.append(body_a)
-    worldbody.append(body_b)
-
-    dual_ref_attrs = (
-        "name",
-        "joint",
-        "joint1",
-        "joint2",
-        "geom",
-        "geom1",
-        "geom2",
-        "body",
-        "body1",
-        "body2",
-        "site",
-        "site1",
-        "site2",
-        "tendon",
-        "tendon1",
-        "tendon2",
-        "actuator",
-        "objname",
-        "slidersite",
-        "cranksite",
-    )
-    _duplicate_and_prefix_section(root, "sensor", prefix_a, prefix_b, dual_ref_attrs)
-    _duplicate_and_prefix_section(root, "actuator", prefix_a, prefix_b, dual_ref_attrs)
-    _duplicate_and_prefix_section(root, "tendon", prefix_a, prefix_b, dual_ref_attrs)
-    _duplicate_and_prefix_section(root, "equality", prefix_a, prefix_b, dual_ref_attrs)
-    _duplicate_and_prefix_section(root, "contact", prefix_a, prefix_b, dual_ref_attrs)
-
-    keyframe = root.find("keyframe")
-    if keyframe is not None:
-        root.remove(keyframe)
+    freejoint_roots = [child for child in list(worldbody) if child.tag == "body" and child.find("freejoint") is not None]
+    if len(freejoint_roots) < 2:
+        raise ValueError(
+            f"Expected at least two root freejoint bodies in merged dual scene, got {len(freejoint_roots)}."
+        )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tree.write(str(out_path), encoding="utf-8", xml_declaration=False)
+    ET.ElementTree(merged_root).write(str(out_path), encoding="utf-8", xml_declaration=False)
     return out_path
 
 
@@ -356,24 +428,27 @@ def _preprocess_dual_humans_for_coupled(
     human_b: np.ndarray,
     scale_a: float,
     scale_b: float,
-    toe_names: list[str],
-    demo_joints: list[str],
+    toe_names_a: list[str],
+    toe_names_b: list[str],
+    demo_joints_a: list[str],
+    demo_joints_b: list[str],
 ) -> tuple[np.ndarray, np.ndarray, list[dict[str, bool]], list[dict[str, bool]]]:
-    demo_proxy = SimpleNamespace(demo_joints=demo_joints)
+    demo_proxy_a = SimpleNamespace(demo_joints=demo_joints_a)
+    demo_proxy_b = SimpleNamespace(demo_joints=demo_joints_b)
     human_a_processed = preprocess_motion_data(
         human_joints=human_a.copy(),
-        retargeter=demo_proxy,
-        foot_names=toe_names,
+        retargeter=demo_proxy_a,
+        foot_names=toe_names_a,
         scale=scale_a,
     )
     human_b_processed = preprocess_motion_data(
         human_joints=human_b.copy(),
-        retargeter=demo_proxy,
-        foot_names=toe_names,
+        retargeter=demo_proxy_b,
+        foot_names=toe_names_b,
         scale=scale_b,
     )
-    foot_a = extract_foot_sticking_sequence_velocity(human_a_processed, demo_joints, toe_names)
-    foot_b = extract_foot_sticking_sequence_velocity(human_b_processed, demo_joints, toe_names)
+    foot_a = extract_foot_sticking_sequence_velocity(human_a_processed, demo_joints_a, toe_names_a)
+    foot_b = extract_foot_sticking_sequence_velocity(human_b_processed, demo_joints_b, toe_names_b)
     return human_a_processed, human_b_processed, foot_a, foot_b
 
 
@@ -395,21 +470,59 @@ def _resolve_asset_paths(constants: SimpleNamespace, asset_root: Path) -> None:
 
 def _resolve_robot_and_motion_config(
     cfg: DualRetargetConfig,
-) -> tuple[RobotConfig, MotionDataConfig]:
-    """Align nested configs with top-level robot/data format while preserving overrides."""
-    robot_config = cfg.robot_config
-    if robot_config.robot_type != cfg.robot:
-        robot_config = replace(robot_config, robot_type=cfg.robot)
+) -> tuple[RobotConfig, RobotConfig, MotionDataConfig, MotionDataConfig]:
+    """Resolve per-agent robot/motion configs from shared settings + optional A/B overrides."""
+    robot_type_a = cfg.robot_a or cfg.robot
+    robot_type_b = cfg.robot_b or cfg.robot
 
-    motion_data_config = cfg.motion_data_config
-    if motion_data_config.robot_type != cfg.robot or motion_data_config.data_format != cfg.data_format:
-        motion_data_config = replace(motion_data_config, robot_type=cfg.robot, data_format=cfg.data_format)
+    robot_config_a = cfg.robot_config
+    if robot_config_a.robot_type != robot_type_a:
+        robot_config_a = replace(robot_config_a, robot_type=robot_type_a)
 
-    return robot_config, motion_data_config
+    robot_config_b = cfg.robot_config
+    if robot_config_b.robot_type != robot_type_b:
+        robot_config_b = replace(robot_config_b, robot_type=robot_type_b)
+
+    motion_data_config_a = cfg.motion_data_config
+    if motion_data_config_a.robot_type != robot_type_a or motion_data_config_a.data_format != cfg.data_format:
+        motion_data_config_a = replace(motion_data_config_a, robot_type=robot_type_a, data_format=cfg.data_format)
+
+    motion_data_config_b = cfg.motion_data_config
+    if motion_data_config_b.robot_type != robot_type_b or motion_data_config_b.data_format != cfg.data_format:
+        motion_data_config_b = replace(motion_data_config_b, robot_type=robot_type_b, data_format=cfg.data_format)
+
+    return robot_config_a, robot_config_b, motion_data_config_a, motion_data_config_b
+
+
+def _build_robot_only_task_context(
+    *,
+    robot_config: RobotConfig,
+    motion_data_config: MotionDataConfig,
+    cfg: DualRetargetConfig,
+    asset_root: Path,
+) -> tuple[SimpleNamespace, np.ndarray, np.ndarray]:
+    task_constants = create_task_constants(
+        robot_config=robot_config,
+        motion_data_config=motion_data_config,
+        task_config=cfg.task_config,
+        task_type="robot_only",
+    )
+    _resolve_asset_paths(task_constants, asset_root)
+    object_local_pts, object_local_pts_demo, _ = setup_object_data(
+        task_type="robot_only",
+        constants=task_constants,
+        object_dir=None,
+        smpl_scale=1.0,
+        task_config=cfg.task_config,
+        augmentation=False,
+    )
+    if object_local_pts is None or object_local_pts_demo is None:
+        raise RuntimeError("Failed to create ground points for robot_only task.")
+    return task_constants, object_local_pts, object_local_pts_demo
 
 
 def main(cfg: DualRetargetConfig) -> None:
-    robot_config, motion_data_config = _resolve_robot_and_motion_config(cfg)
+    robot_config_a, robot_config_b, motion_data_config_a, motion_data_config_b = _resolve_robot_and_motion_config(cfg)
 
     sequence_file = _pick_sequence_file(cfg.data_dir, cfg.sequence_id)
     sequence_id, fps, human_a, human_b, height_a, height_b = _load_dual_sequence(sequence_file)
@@ -422,28 +535,24 @@ def main(cfg: DualRetargetConfig) -> None:
     logger.info("Sequence: %s", sequence_id)
     logger.info("Frames: %d, Joints: %d, FPS: %d", human_a.shape[0], human_a.shape[1], fps)
     logger.info("Heights (A/B): %.3f / %.3f", height_a, height_b)
+    logger.info("Robots (A/B): %s / %s", robot_config_a.robot_type, robot_config_b.robot_type)
     logger.info("Input source: %s", sequence_file)
 
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    task_constants = create_task_constants(
-        robot_config=robot_config,
-        motion_data_config=motion_data_config,
-        task_config=cfg.task_config,
-        task_type="robot_only",
-    )
     asset_root = Path(__file__).resolve().parents[1]
-    _resolve_asset_paths(task_constants, asset_root)
-    object_local_pts, object_local_pts_demo, _ = setup_object_data(
-        task_type="robot_only",
-        constants=task_constants,
-        object_dir=None,
-        smpl_scale=1.0,
-        task_config=cfg.task_config,
-        augmentation=False,
+    task_constants_a, object_local_pts_a, object_local_pts_demo_a = _build_robot_only_task_context(
+        robot_config=robot_config_a,
+        motion_data_config=motion_data_config_a,
+        cfg=cfg,
+        asset_root=asset_root,
     )
-    if object_local_pts is None or object_local_pts_demo is None:
-        raise RuntimeError("Failed to create ground points for robot_only task.")
+    task_constants_b, object_local_pts_b, object_local_pts_demo_b = _build_robot_only_task_context(
+        robot_config=robot_config_b,
+        motion_data_config=motion_data_config_b,
+        cfg=cfg,
+        asset_root=asset_root,
+    )
 
     # Persist inspected/prepared inputs for Part 1 debugging.
     prepared_out = cfg.output_dir / f"{sequence_id}_part1_inputs.npz"
@@ -455,8 +564,10 @@ def main(cfg: DualRetargetConfig) -> None:
         human_joints_B=human_b,
         height_A=height_a,
         height_B=height_b,
-        robot=robot_config.robot_type,
-        data_format=motion_data_config.data_format,
+        robot_A=robot_config_a.robot_type,
+        robot_B=robot_config_b.robot_type,
+        data_format_A=motion_data_config_a.data_format,
+        data_format_B=motion_data_config_b.data_format,
     )
     logger.info("Saved Part-1 prepared inputs: %s", prepared_out)
 
@@ -467,19 +578,22 @@ def main(cfg: DualRetargetConfig) -> None:
     if height_a <= 0 or height_b <= 0:
         raise ValueError(f"Invalid height(s): A={height_a}, B={height_b}")
 
-    scale_a = task_constants.ROBOT_HEIGHT / height_a
-    scale_b = task_constants.ROBOT_HEIGHT / height_b
-    toe_names = motion_data_config.toe_names
+    scale_a = task_constants_a.ROBOT_HEIGHT / height_a
+    scale_b = task_constants_b.ROBOT_HEIGHT / height_b
+    toe_names_a = motion_data_config_a.toe_names
+    toe_names_b = motion_data_config_b.toe_names
 
     if cfg.coupled_dual:
-        robot_xml_single = Path(str(task_constants.ROBOT_URDF_FILE).replace(".urdf", ".xml"))
+        robot_xml_a = Path(str(task_constants_a.ROBOT_URDF_FILE).replace(".urdf", ".xml"))
+        robot_xml_b = Path(str(task_constants_b.ROBOT_URDF_FILE).replace(".urdf", ".xml"))
         dual_scene_xml = (
             cfg.dual_scene_xml
             if cfg.dual_scene_xml is not None
             else cfg.output_dir / f"{sequence_id}_dual_scene.xml"
         )
-        dual_scene_xml = _build_dual_scene_xml_from_single(
-            single_xml_path=robot_xml_single,
+        dual_scene_xml = _build_dual_scene_xml_from_pair(
+            robot_xml_a=robot_xml_a,
+            robot_xml_b=robot_xml_b,
             out_path=dual_scene_xml,
             prefix_a=cfg.dual_prefix_a,
             prefix_b=cfg.dual_prefix_b,
@@ -491,8 +605,10 @@ def main(cfg: DualRetargetConfig) -> None:
             human_b=human_b,
             scale_a=scale_a,
             scale_b=scale_b,
-            toe_names=toe_names,
-            demo_joints=list(task_constants.DEMO_JOINTS),
+            toe_names_a=toe_names_a,
+            toe_names_b=toe_names_b,
+            demo_joints_a=list(task_constants_a.DEMO_JOINTS),
+            demo_joints_b=list(task_constants_b.DEMO_JOINTS),
         )
 
         q_nominal_a: np.ndarray | None = None
@@ -504,20 +620,20 @@ def main(cfg: DualRetargetConfig) -> None:
             q_nominal_a = _run_single_agent_retarget_processed(
                 human_processed=human_a_processed,
                 foot_sticking_sequences=foot_a,
-                constants=task_constants,
+                constants=task_constants_a,
                 retargeter_cfg=cfg.retargeter,
-                object_local_pts=object_local_pts,
-                object_local_pts_demo=object_local_pts_demo,
+                object_local_pts=object_local_pts_a,
+                object_local_pts_demo=object_local_pts_demo_a,
                 out_path=warm_a_path,
             )
             logger.info("Running independent warm-start retargeting for B...")
             q_nominal_b = _run_single_agent_retarget_processed(
                 human_processed=human_b_processed,
                 foot_sticking_sequences=foot_b,
-                constants=task_constants,
+                constants=task_constants_b,
                 retargeter_cfg=cfg.retargeter,
-                object_local_pts=object_local_pts,
-                object_local_pts_demo=object_local_pts_demo,
+                object_local_pts=object_local_pts_b,
+                object_local_pts_demo=object_local_pts_demo_b,
                 out_path=warm_b_path,
             )
 
@@ -542,11 +658,20 @@ def main(cfg: DualRetargetConfig) -> None:
             q_init_a = np.asarray(q_nominal_a[0], dtype=np.float32)
             q_init_b = np.asarray(q_nominal_b[0], dtype=np.float32)
         else:
-            q_init_a = _build_q_init(human_a_processed, task_constants.ROBOT_DOF)
-            q_init_b = _build_q_init(human_b_processed, task_constants.ROBOT_DOF)
+            q_init_a = _build_q_init(human_a_processed, task_constants_a.ROBOT_DOF)
+            q_init_b = _build_q_init(human_b_processed, task_constants_b.ROBOT_DOF)
+
+        dual_task_constants_a = _make_dual_dense_task_constants(task_constants_a, robot_config_a.robot_type)
+        dual_task_constants_b = _make_dual_dense_task_constants(task_constants_b, robot_config_b.robot_type)
+        logger.info(
+            "Using dual-dense Laplacian mappings: A=%d targets, B=%d targets",
+            len(dual_task_constants_a.JOINTS_MAPPING),
+            len(dual_task_constants_b.JOINTS_MAPPING),
+        )
 
         dual_retargeter = DualInteractionMeshRetargeter(
-            task_constants=task_constants,
+            task_constants_a=dual_task_constants_a,
+            task_constants_b=dual_task_constants_b,
             dual_scene_xml_path=str(dual_scene_xml),
             robot_a_prefix=cfg.dual_prefix_a,
             robot_b_prefix=cfg.dual_prefix_b,
@@ -593,6 +718,10 @@ def main(cfg: DualRetargetConfig) -> None:
             scale_A=scale_a,
             scale_B=scale_b,
             mode="coupled_dual",
+            robot_A=robot_config_a.robot_type,
+            robot_B=robot_config_b.robot_type,
+            data_format_A=motion_data_config_a.data_format,
+            data_format_B=motion_data_config_b.data_format,
             dual_scene_xml=str(dual_scene_xml),
             dual_prefix_A=cfg.dual_prefix_a,
             dual_prefix_B=cfg.dual_prefix_b,
@@ -607,11 +736,11 @@ def main(cfg: DualRetargetConfig) -> None:
     qpos_a = _run_single_agent_retarget(
         human_joints=human_a,
         smpl_scale=scale_a,
-        toe_names=toe_names,
-        constants=task_constants,
+        toe_names=toe_names_a,
+        constants=task_constants_a,
         retargeter_cfg=cfg.retargeter,
-        object_local_pts=object_local_pts,
-        object_local_pts_demo=object_local_pts_demo,
+        object_local_pts=object_local_pts_a,
+        object_local_pts_demo=object_local_pts_demo_a,
         out_path=tmp_a,
     )
 
@@ -619,11 +748,11 @@ def main(cfg: DualRetargetConfig) -> None:
     qpos_b = _run_single_agent_retarget(
         human_joints=human_b,
         smpl_scale=scale_b,
-        toe_names=toe_names,
-        constants=task_constants,
+        toe_names=toe_names_b,
+        constants=task_constants_b,
         retargeter_cfg=cfg.retargeter,
-        object_local_pts=object_local_pts,
-        object_local_pts_demo=object_local_pts_demo,
+        object_local_pts=object_local_pts_b,
+        object_local_pts_demo=object_local_pts_demo_b,
         out_path=tmp_b,
     )
 
@@ -640,6 +769,10 @@ def main(cfg: DualRetargetConfig) -> None:
         height_B=height_b,
         scale_A=scale_a,
         scale_B=scale_b,
+        robot_A=robot_config_a.robot_type,
+        robot_B=robot_config_b.robot_type,
+        data_format_A=motion_data_config_a.data_format,
+        data_format_B=motion_data_config_b.data_format,
     )
     logger.info("Saved dual Part-1 retarget output: %s", final_path)
 

@@ -52,6 +52,11 @@ R_YUP_TO_ZUP = np.array(
 # Quaternion for +90 deg rotation around x-axis in wxyz.
 Q_YUP_TO_ZUP = np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
 
+DEFAULT_URDF_BY_ROBOT: dict[str, str] = {
+    "g1": "src/holosoma_retargeting/holosoma_retargeting/models/g1/g1_29dof.urdf",
+    "t1": "src/holosoma_retargeting/holosoma_retargeting/models/t1/t1_23dof.urdf",
+}
+
 
 @dataclass
 class Config:
@@ -82,8 +87,14 @@ class Config:
     show_robots: bool = False
     """Render robot overlays if qpos is available."""
 
-    robot_urdf: str = "src/holosoma_retargeting/holosoma_retargeting/models/g1/g1_29dof.urdf"
-    """URDF path used for robot overlay rendering (e.g., Unitree G1)."""
+    robot_urdf: str | None = None
+    """Deprecated shared URDF path used for both A and B when per-agent paths are not provided."""
+
+    robot_urdf_a: str | None = None
+    """URDF path for robot A overlay. If None, infer from npz metadata (robot_A) or fallback defaults."""
+
+    robot_urdf_b: str | None = None
+    """URDF path for robot B overlay. If None, infer from npz metadata (robot_B) or fallback defaults."""
 
     qpos_npz: str | None = None
     """Optional npz containing qpos_A/qpos_B. If None, try reading from data_npz."""
@@ -151,6 +162,37 @@ def _load_qpos_tracks(npz_path: Path, frame_stride: int) -> tuple[np.ndarray | N
         qpos_a = qpos_a[:n]
         qpos_b = qpos_b[:n]
     return qpos_a, qpos_b
+
+
+def _infer_robot_type(data: np.lib.npyio.NpzFile, key: str) -> str | None:
+    if key not in data:
+        return None
+    value = data[key]
+    if isinstance(value, np.ndarray):
+        value = value.item()
+    robot_type = str(value).strip().lower()
+    if not robot_type:
+        return None
+    return robot_type.split("_")[0]
+
+
+def _resolve_robot_urdf_paths(cfg: Config, qpos_npz_path: Path, has_b: bool) -> tuple[Path, Path | None]:
+    data = np.load(str(qpos_npz_path), allow_pickle=True)
+    robot_type_a = _infer_robot_type(data, "robot_A")
+    robot_type_b = _infer_robot_type(data, "robot_B")
+
+    urdf_a = cfg.robot_urdf_a or cfg.robot_urdf
+    if urdf_a is None:
+        urdf_a = DEFAULT_URDF_BY_ROBOT.get(robot_type_a or "", DEFAULT_URDF_BY_ROBOT["g1"])
+
+    urdf_b_path: Path | None = None
+    if has_b:
+        urdf_b = cfg.robot_urdf_b or cfg.robot_urdf
+        if urdf_b is None:
+            urdf_b = DEFAULT_URDF_BY_ROBOT.get(robot_type_b or "", urdf_a)
+        urdf_b_path = Path(urdf_b)
+
+    return Path(urdf_a), urdf_b_path
 
 
 def _quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
@@ -263,22 +305,30 @@ def main(cfg: Config) -> None:
     robot_b = None
     robot_a_root = None
     robot_b_root = None
-    robot_dof = None
+    robot_dof_a = None
+    robot_dof_b = None
     if cfg.show_robots:
-        urdf_path = Path(cfg.robot_urdf)
-        robot_urdf = yourdfpy.URDF.load(str(urdf_path), load_meshes=True, build_scene_graph=True)
+        urdf_a_path, urdf_b_path = _resolve_robot_urdf_paths(cfg, qpos_npz_path, joints_b is not None)
+        robot_urdf_a = yourdfpy.URDF.load(str(urdf_a_path), load_meshes=True, build_scene_graph=True)
 
         robot_a_root = server.scene.add_frame("/robots/A", show_axes=False)
-        robot_a = ViserUrdf(server, urdf_or_path=robot_urdf, root_node_name="/robots/A")
+        robot_a = ViserUrdf(server, urdf_or_path=robot_urdf_a, root_node_name="/robots/A")
         robot_a.show_visual = True
+        robot_dof_a = len(robot_a.get_actuated_joint_limits())
 
         if joints_b is not None:
+            if urdf_b_path is None:
+                raise ValueError("Could not resolve robot_urdf for B.")
+            robot_urdf_b = yourdfpy.URDF.load(str(urdf_b_path), load_meshes=True, build_scene_graph=True)
             robot_b_root = server.scene.add_frame("/robots/B", show_axes=False)
-            robot_b = ViserUrdf(server, urdf_or_path=robot_urdf, root_node_name="/robots/B")
+            robot_b = ViserUrdf(server, urdf_or_path=robot_urdf_b, root_node_name="/robots/B")
             robot_b.show_visual = True
+            robot_dof_b = len(robot_b.get_actuated_joint_limits())
 
-        robot_dof = len(robot_a.get_actuated_joint_limits())
-        print(f"[dual_joint_renderer] robot overlay enabled | urdf={urdf_path} | dof={robot_dof}")
+        print(
+            f"[dual_joint_renderer] robot overlay enabled | urdf_A={urdf_a_path} | dof_A={robot_dof_a}"
+            + (f" | urdf_B={urdf_b_path} | dof_B={robot_dof_b}" if joints_b is not None else "")
+        )
 
         # Clamp timeline to available qpos frames.
         n_frames = min(n_frames, qpos_a.shape[0])  # type: ignore[union-attr]
@@ -320,23 +370,27 @@ def main(cfg: Config) -> None:
         if joints_b is not None and b_lines_handle is not None:
             b_lines_handle.points = _edge_segments(joints_b[i], SMPLX22_EDGES)
 
-        if cfg.show_robots and qpos_a is not None and robot_a is not None and robot_a_root is not None and robot_dof is not None:
+        if cfg.show_robots and qpos_a is not None and robot_a is not None and robot_a_root is not None and robot_dof_a is not None:
             qa = qpos_a[i]
+            if qa.shape[0] < 7 + robot_dof_a:
+                raise ValueError(f"qpos_A frame has width {qa.shape[0]}, expected at least {7 + robot_dof_a}")
             robot_a_root.position = qa[0:3]
             robot_a_root.wxyz = qa[3:7]
-            robot_a.update_cfg(qa[7 : 7 + robot_dof])
+            robot_a.update_cfg(qa[7 : 7 + robot_dof_a])
         if (
             cfg.show_robots
             and joints_b is not None
             and qpos_b is not None
             and robot_b is not None
             and robot_b_root is not None
-            and robot_dof is not None
+            and robot_dof_b is not None
         ):
             qb = qpos_b[i]
+            if qb.shape[0] < 7 + robot_dof_b:
+                raise ValueError(f"qpos_B frame has width {qb.shape[0]}, expected at least {7 + robot_dof_b}")
             robot_b_root.position = qb[0:3]
             robot_b_root.wxyz = qb[3:7]
-            robot_b.update_cfg(qb[7 : 7 + robot_dof])
+            robot_b.update_cfg(qb[7 : 7 + robot_dof_b])
 
     @frame_slider.on_update
     def _(_event) -> None:

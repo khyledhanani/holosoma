@@ -33,6 +33,14 @@ class ContactLinearization:
     whitelisted: bool
 
 
+@dataclass(frozen=True)
+class BodyPointTarget:
+    """A point target attached to a MuJoCo body in local-body coordinates."""
+
+    body_name: str
+    point_offset: np.ndarray
+
+
 class DualInteractionMeshRetargeter:
     """Dual-robot SQP retargeter core for synchronized A/B retargeting.
 
@@ -44,9 +52,10 @@ class DualInteractionMeshRetargeter:
 
     def __init__(
         self,
-        task_constants: ModuleType,
+        task_constants_a: ModuleType,
         dual_scene_xml_path: str,
         *,
+        task_constants_b: ModuleType | None = None,
         robot_a_prefix: str = "A_",
         robot_b_prefix: str = "B_",
         q_a_init_idx: int = -7,
@@ -69,7 +78,8 @@ class DualInteractionMeshRetargeter:
         ab_pair_whitelist: set[tuple[str, str]] | None = None,
         debug: bool = False,
     ):
-        self.task_constants = task_constants
+        self.task_constants_a = task_constants_a
+        self.task_constants_b = task_constants_b if task_constants_b is not None else task_constants_a
         self.debug = debug
 
         self.robot_a_prefix = robot_a_prefix
@@ -100,16 +110,28 @@ class DualInteractionMeshRetargeter:
         self.robot_model = mujoco.MjModel.from_xml_path(dual_scene_xml_path)
         self.robot_data = mujoco.MjData(self.robot_model)
 
-        self.demo_joints = list(task_constants.DEMO_JOINTS)
-        if len(self.demo_joints) < 22:
+        self.demo_joints_a = list(self.task_constants_a.DEMO_JOINTS)
+        self.demo_joints_b = list(self.task_constants_b.DEMO_JOINTS)
+        if len(self.demo_joints_a) < 22:
             raise ValueError(
-                f"Expected at least 22 demo joints for SMPL-X source graph, got {len(self.demo_joints)}."
+                f"Expected at least 22 demo joints for A, got {len(self.demo_joints_a)}."
             )
-        self.source_joint_names = self.demo_joints[:22]
+        if len(self.demo_joints_b) < 22:
+            raise ValueError(
+                f"Expected at least 22 demo joints for B, got {len(self.demo_joints_b)}."
+            )
+        self.source_joint_names_a = self.demo_joints_a[:22]
+        self.source_joint_names_b = self.demo_joints_b[:22]
+        self.num_source_a = len(self.source_joint_names_a)
+        self.num_source_b = len(self.source_joint_names_b)
+        self.num_source_total = self.num_source_a + self.num_source_b
 
-        self.base_joint_to_link = dict(task_constants.JOINTS_MAPPING)
-        self.base_foot_links = list(task_constants.FOOT_STICKING_LINKS)
-        self.robot_dof = int(task_constants.ROBOT_DOF)
+        self.base_joint_to_link_a = dict(self.task_constants_a.JOINTS_MAPPING)
+        self.base_joint_to_link_b = dict(self.task_constants_b.JOINTS_MAPPING)
+        self.base_foot_links_a = list(self.task_constants_a.FOOT_STICKING_LINKS)
+        self.base_foot_links_b = list(self.task_constants_b.FOOT_STICKING_LINKS)
+        self.robot_dof_expected_a = int(self.task_constants_a.ROBOT_DOF)
+        self.robot_dof_expected_b = int(self.task_constants_b.ROBOT_DOF)
 
         self._setup_joint_layouts()
         self._setup_mapped_links()
@@ -120,29 +142,69 @@ class DualInteractionMeshRetargeter:
     # Setup helpers
     # --------------------------------------------------------------------------
     def _setup_joint_layouts(self) -> None:
-        free_joint_ids = [j for j in range(self.robot_model.njnt) if self.robot_model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE]
+        free_joint_ids = [
+            j for j in range(self.robot_model.njnt) if self.robot_model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE
+        ]
         if len(free_joint_ids) < 2:
             raise ValueError(
                 "DualInteractionMeshRetargeter expects a dual scene with at least two free joints (robot A and robot B)."
             )
 
-        free_joint_ids = sorted(free_joint_ids, key=lambda j: int(self.robot_model.jnt_qposadr[j]))
-        self.free_joint_id_a = int(free_joint_ids[0])
-        self.free_joint_id_b = int(free_joint_ids[1])
+        free_joint_ids_sorted = sorted(free_joint_ids, key=lambda j: int(self.robot_model.jnt_qposadr[j]))
+
+        joint_id_a: int | None = None
+        joint_id_b: int | None = None
+        for j in free_joint_ids_sorted:
+            body_id = int(self.robot_model.jnt_bodyid[j])
+            body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+            if joint_id_a is None and body_name.startswith(self.robot_a_prefix):
+                joint_id_a = int(j)
+            if joint_id_b is None and body_name.startswith(self.robot_b_prefix):
+                joint_id_b = int(j)
+
+        if joint_id_a is None or joint_id_b is None:
+            joint_id_a = int(free_joint_ids_sorted[0])
+            joint_id_b = int(free_joint_ids_sorted[1])
+
+        self.free_joint_id_a = joint_id_a
+        self.free_joint_id_b = joint_id_b
 
         self.qadr_a = int(self.robot_model.jnt_qposadr[self.free_joint_id_a])
         self.qadr_b = int(self.robot_model.jnt_qposadr[self.free_joint_id_b])
 
-        # Assume each robot follows MuJoCo layout [free(7), actuated(robot_dof)] for qpos.
-        self.q_block_a = np.arange(self.qadr_a, self.qadr_a + 7 + self.robot_dof, dtype=int)
-        self.q_block_b = np.arange(self.qadr_b, self.qadr_b + 7 + self.robot_dof, dtype=int)
+        qadr_all_free = sorted(int(self.robot_model.jnt_qposadr[j]) for j in free_joint_ids)
+
+        def _next_qadr(qadr: int) -> int:
+            return next((q for q in qadr_all_free if q > qadr), int(self.robot_model.nq))
+
+        qend_a = _next_qadr(self.qadr_a)
+        qend_b = _next_qadr(self.qadr_b)
+        if qend_a <= self.qadr_a or qend_b <= self.qadr_b:
+            raise ValueError("Invalid free-joint qpos layout in dual scene model.")
+
+        self.q_block_a = np.arange(self.qadr_a, qend_a, dtype=int)
+        self.q_block_b = np.arange(self.qadr_b, qend_b, dtype=int)
+
+        if len(self.q_block_a) < 7 or len(self.q_block_b) < 7:
+            raise ValueError("Each robot block must contain at least freejoint qpos (7).")
+        self.robot_dof_a = len(self.q_block_a) - 7
+        self.robot_dof_b = len(self.q_block_b) - 7
+
+        if self.robot_dof_a != self.robot_dof_expected_a:
+            raise ValueError(
+                f"Robot A DOF mismatch between constants ({self.robot_dof_expected_a}) and scene ({self.robot_dof_a})."
+            )
+        if self.robot_dof_b != self.robot_dof_expected_b:
+            raise ValueError(
+                f"Robot B DOF mismatch between constants ({self.robot_dof_expected_b}) and scene ({self.robot_dof_b})."
+            )
 
         self.base_quat_slice_a = slice(self.qadr_a + 3, self.qadr_a + 7)
         self.base_quat_slice_b = slice(self.qadr_b + 3, self.qadr_b + 7)
 
         start_local_a = 7 + self.q_a_init_idx
         start_local_b = 7 + self.q_b_init_idx
-        if start_local_a < 0 or start_local_b < 0:
+        if start_local_a < 0 or start_local_b < 0 or start_local_a >= len(self.q_block_a) or start_local_b >= len(self.q_block_b):
             raise ValueError("q_*_init_idx must be >= -7.")
         self.start_local_a = int(start_local_a)
         self.start_local_b = int(start_local_b)
@@ -156,18 +218,49 @@ class DualInteractionMeshRetargeter:
 
     def _setup_mapped_links(self) -> None:
         self.laplacian_match_links_a = {
-            joint_name: f"{self.robot_a_prefix}{link_name}" for joint_name, link_name in self.base_joint_to_link.items()
+            joint_name: self._prefix_body_point_target(link_target, self.robot_a_prefix)
+            for joint_name, link_target in self.base_joint_to_link_a.items()
         }
         self.laplacian_match_links_b = {
-            joint_name: f"{self.robot_b_prefix}{link_name}" for joint_name, link_name in self.base_joint_to_link.items()
+            joint_name: self._prefix_body_point_target(link_target, self.robot_b_prefix)
+            for joint_name, link_target in self.base_joint_to_link_b.items()
         }
 
         self.foot_links_a = {
-            f"{self.robot_a_prefix}{link_name}": f"{self.robot_a_prefix}{link_name}" for link_name in self.base_foot_links
+            f"{self.robot_a_prefix}{link_name}": f"{self.robot_a_prefix}{link_name}" for link_name in self.base_foot_links_a
         }
         self.foot_links_b = {
-            f"{self.robot_b_prefix}{link_name}": f"{self.robot_b_prefix}{link_name}" for link_name in self.base_foot_links
+            f"{self.robot_b_prefix}{link_name}": f"{self.robot_b_prefix}{link_name}" for link_name in self.base_foot_links_b
         }
+
+    @staticmethod
+    def _prefix_body_point_target(
+        target: str | tuple[str, np.ndarray] | BodyPointTarget,
+        prefix: str,
+    ) -> str | BodyPointTarget:
+        if isinstance(target, BodyPointTarget):
+            return BodyPointTarget(
+                body_name=f"{prefix}{target.body_name}",
+                point_offset=np.asarray(target.point_offset, dtype=float).reshape(3),
+            )
+        if isinstance(target, tuple):
+            body_name, point_offset = target
+            return BodyPointTarget(
+                body_name=f"{prefix}{body_name}",
+                point_offset=np.asarray(point_offset, dtype=float).reshape(3),
+            )
+        return f"{prefix}{target}"
+
+    @staticmethod
+    def _resolve_body_point_target(
+        target: str | tuple[str, np.ndarray] | BodyPointTarget,
+    ) -> tuple[str, np.ndarray]:
+        if isinstance(target, BodyPointTarget):
+            return target.body_name, np.asarray(target.point_offset, dtype=float).reshape(3)
+        if isinstance(target, tuple):
+            body_name, point_offset = target
+            return body_name, np.asarray(point_offset, dtype=float).reshape(3)
+        return target, np.zeros(3, dtype=float)
 
     def _setup_bounds_and_costs(self) -> None:
         nq = self.robot_model.nq
@@ -187,36 +280,44 @@ class DualInteractionMeshRetargeter:
         self.q_b_lb = lower[self.q_b_indices].copy()
         self.q_b_ub = upper[self.q_b_indices].copy()
 
-        manual_lb = getattr(self.task_constants, "MANUAL_LB", {})
-        manual_ub = getattr(self.task_constants, "MANUAL_UB", {})
-        manual_cost = getattr(self.task_constants, "MANUAL_COST", {})
+        manual_lb_a = getattr(self.task_constants_a, "MANUAL_LB", {})
+        manual_ub_a = getattr(self.task_constants_a, "MANUAL_UB", {})
+        manual_cost_a = getattr(self.task_constants_a, "MANUAL_COST", {})
+        manual_lb_b = getattr(self.task_constants_b, "MANUAL_LB", {})
+        manual_ub_b = getattr(self.task_constants_b, "MANUAL_UB", {})
+        manual_cost_b = getattr(self.task_constants_b, "MANUAL_COST", {})
 
-        for k, v in manual_lb.items():
+        for k, v in manual_lb_a.items():
             idx = int(k)
             if 0 <= idx < self.nq_a:
                 self.q_a_lb[idx] = float(v)
+        for k, v in manual_lb_b.items():
+            idx = int(k)
             if 0 <= idx < self.nq_b:
                 self.q_b_lb[idx] = float(v)
-        for k, v in manual_ub.items():
+        for k, v in manual_ub_a.items():
             idx = int(k)
             if 0 <= idx < self.nq_a:
                 self.q_a_ub[idx] = float(v)
+        for k, v in manual_ub_b.items():
+            idx = int(k)
             if 0 <= idx < self.nq_b:
                 self.q_b_ub[idx] = float(v)
 
         self.Q_diag_a = np.zeros(self.nq_a, dtype=float)
         self.Q_diag_b = np.zeros(self.nq_b, dtype=float)
-        for k, v in manual_cost.items():
+        for k, v in manual_cost_a.items():
             idx = int(k)
             if 0 <= idx < self.nq_a:
                 self.Q_diag_a[idx] = float(v)
+        for k, v in manual_cost_b.items():
+            idx = int(k)
             if 0 <= idx < self.nq_b:
                 self.Q_diag_b[idx] = float(v)
 
     def _setup_source_graph_indices(self) -> None:
-        self.source_name_to_idx = {n: i for i, n in enumerate(self.source_joint_names)}
-        self.num_source_per_agent = len(self.source_joint_names)
-        self.num_source_total = self.num_source_per_agent * 2
+        self.source_name_to_idx_a = {n: i for i, n in enumerate(self.source_joint_names_a)}
+        self.source_name_to_idx_b = {n: i for i, n in enumerate(self.source_joint_names_b)}
 
         cross_critical = {
             "L_Wrist",
@@ -226,8 +327,10 @@ class DualInteractionMeshRetargeter:
             "L_Shoulder",
             "R_Shoulder",
         }
-        self.cross_rescue_a = [self.source_name_to_idx[n] for n in cross_critical if n in self.source_name_to_idx]
-        self.cross_rescue_b = [i + self.num_source_per_agent for i in self.cross_rescue_a]
+        self.cross_rescue_a = [self.source_name_to_idx_a[n] for n in cross_critical if n in self.source_name_to_idx_a]
+        self.cross_rescue_b = [
+            self.num_source_a + self.source_name_to_idx_b[n] for n in cross_critical if n in self.source_name_to_idx_b
+        ]
 
         critical_weights = {
             "Pelvis",
@@ -244,14 +347,18 @@ class DualInteractionMeshRetargeter:
             "R_Shoulder",
         }
         self.laplacian_weights = np.ones(self.num_source_total, dtype=float)
-        for i, name in enumerate(self.source_joint_names):
+        for i, name in enumerate(self.source_joint_names_a):
             if name in critical_weights:
                 self.laplacian_weights[i] = 2.5
-                self.laplacian_weights[i + self.num_source_per_agent] = 2.5
+        offset_b = self.num_source_a
+        for i, name in enumerate(self.source_joint_names_b):
+            if name in critical_weights:
+                self.laplacian_weights[offset_b + i] = 2.5
 
-        nominal_indices = np.asarray(getattr(self.task_constants, "NOMINAL_TRACKING_INDICES", []), dtype=int)
-        self.track_nominal_indices_a = self._project_nominal_indices(nominal_indices, self.start_local_a, self.nq_a)
-        self.track_nominal_indices_b = self._project_nominal_indices(nominal_indices, self.start_local_b, self.nq_b)
+        nominal_indices_a = np.asarray(getattr(self.task_constants_a, "NOMINAL_TRACKING_INDICES", []), dtype=int)
+        nominal_indices_b = np.asarray(getattr(self.task_constants_b, "NOMINAL_TRACKING_INDICES", []), dtype=int)
+        self.track_nominal_indices_a = self._project_nominal_indices(nominal_indices_a, self.start_local_a, self.nq_a)
+        self.track_nominal_indices_b = self._project_nominal_indices(nominal_indices_b, self.start_local_b, self.nq_b)
 
     # --------------------------------------------------------------------------
     # Public API
@@ -287,9 +394,13 @@ class DualInteractionMeshRetargeter:
             )
         if human_joint_motions_a.ndim != 3 or human_joint_motions_a.shape[2] != 3:
             raise ValueError(f"Expected (T, J, 3), got {human_joint_motions_a.shape}")
-        if human_joint_motions_a.shape[1] < self.num_source_per_agent:
+        if human_joint_motions_a.shape[1] < self.num_source_a:
             raise ValueError(
-                f"Expected at least {self.num_source_per_agent} source joints, got {human_joint_motions_a.shape[1]}"
+                f"Expected at least {self.num_source_a} source joints for A, got {human_joint_motions_a.shape[1]}"
+            )
+        if human_joint_motions_b.shape[1] < self.num_source_b:
+            raise ValueError(
+                f"Expected at least {self.num_source_b} source joints for B, got {human_joint_motions_b.shape[1]}"
             )
 
         num_frames = int(human_joint_motions_a.shape[0])
@@ -314,8 +425,8 @@ class DualInteractionMeshRetargeter:
             for t in pbar:
                 source_vertices = np.vstack(
                     [
-                        human_joint_motions_a[t, : self.num_source_per_agent, :],
-                        human_joint_motions_b[t, : self.num_source_per_agent, :],
+                        human_joint_motions_a[t, : self.num_source_a, :],
+                        human_joint_motions_b[t, : self.num_source_b, :],
                     ]
                 )
                 _, adj_list, target_laplacian = self._build_source_graph(source_vertices)
@@ -545,17 +656,18 @@ class DualInteractionMeshRetargeter:
         return kept
 
     def _add_cross_agent_rescue_edges(self, vertices: np.ndarray, edges: set[tuple[int, int]]) -> set[tuple[int, int]]:
-        n = self.num_source_per_agent
-        a_ids = np.arange(0, n, dtype=int)
-        b_ids = np.arange(n, 2 * n, dtype=int)
+        n_a = self.num_source_a
+        n_b = self.num_source_b
+        a_ids = np.arange(0, n_a, dtype=int)
+        b_ids = np.arange(n_a, n_a + n_b, dtype=int)
         dmat = np.linalg.norm(vertices[:, None, :] - vertices[None, :, :], axis=-1)
 
         def _cross_count(idx: int) -> int:
             count = 0
             for i, j in edges:
-                if i == idx and j >= n:
+                if i == idx and j >= n_a:
                     count += 1
-                elif j == idx and i >= n:
+                elif j == idx and i >= n_a:
                     count += 1
             return count
 
@@ -599,14 +711,14 @@ class DualInteractionMeshRetargeter:
         target_vertices = source_vertices.copy()
         J_target = np.zeros((3 * n_v, self.nq_ab), dtype=float)
 
-        for i, joint_name in enumerate(self.source_joint_names):
+        for i, joint_name in enumerate(self.source_joint_names_a):
             row = slice(3 * i, 3 * (i + 1))
             if joint_name in pa_dict:
                 target_vertices[i] = pa_dict[joint_name]
                 J_target[row, :] = self._project_j_full_to_dx(ja_dict[joint_name])
 
-        offset = self.num_source_per_agent
-        for i, joint_name in enumerate(self.source_joint_names):
+        offset = self.num_source_a
+        for i, joint_name in enumerate(self.source_joint_names_b):
             idx = offset + i
             row = slice(3 * idx, 3 * (idx + 1))
             if joint_name in pb_dict:
@@ -689,12 +801,13 @@ class DualInteractionMeshRetargeter:
         if arr.ndim != 2 or arr.shape[0] != n_frames:
             raise ValueError(f"Nominal sequence for agent {agent} must have shape (T, D) with T={n_frames}, got {arr.shape}")
 
-        expected_local = 7 + self.robot_dof
         if agent == "A":
             expected_opt = self.nq_a
+            expected_local = 7 + self.robot_dof_a
             start_local = self.start_local_a
         else:
             expected_opt = self.nq_b
+            expected_local = 7 + self.robot_dof_b
             start_local = self.start_local_b
 
         if arr.shape[1] == expected_opt:
@@ -953,20 +1066,26 @@ class DualInteractionMeshRetargeter:
         T = self._build_transform_qdot_to_qvel_fast()
         return Jp @ T
 
-    def _calc_manipulator_jacobians(self, q: np.ndarray, links: dict[str, str]) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    def _calc_manipulator_jacobians(
+        self,
+        q: np.ndarray,
+        links: dict[str, str | tuple[str, np.ndarray] | BodyPointTarget],
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         self.robot_data.qpos[:] = q
         mujoco.mj_forward(self.robot_model, self.robot_data)
 
         J_dict: dict[str, np.ndarray] = {}
         p_dict: dict[str, np.ndarray] = {}
 
-        for key, link_name in links.items():
-            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, link_name)
+        for key, target in links.items():
+            body_name, point_offset = self._resolve_body_point_target(target)
+            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
             if body_id == -1:
                 # Ignore missing links to keep class robust to imperfect dual XML naming.
                 continue
-            J = self._calc_contact_jacobian_from_point(body_id, np.zeros(3))
-            pos = self.robot_data.xpos[body_id].copy()
+            J = self._calc_contact_jacobian_from_point(body_id, point_offset)
+            rot_world_body = self.robot_data.xmat[body_id].reshape(3, 3)
+            pos = self.robot_data.xpos[body_id] + rot_world_body @ point_offset
             J_dict[key] = np.asarray(J, dtype=float, copy=True)
             p_dict[key] = np.asarray(pos, dtype=float, copy=True)
         return J_dict, p_dict
@@ -975,17 +1094,21 @@ class DualInteractionMeshRetargeter:
     # Local robot state IO
     # --------------------------------------------------------------------------
     def _write_local_robot_state(self, q_full: np.ndarray, q_local: np.ndarray, *, agent: str) -> None:
-        if q_local.shape[0] < 7 + self.robot_dof:
-            raise ValueError(f"Expected local state length >= {7 + self.robot_dof}, got {q_local.shape[0]}")
         if agent == "A":
             block = self.q_block_a
+            min_width = 7 + self.robot_dof_a
         else:
             block = self.q_block_b
-        q_full[block[: 7 + self.robot_dof]] = q_local[: 7 + self.robot_dof]
+            min_width = 7 + self.robot_dof_b
+        if q_local.shape[0] < min_width:
+            raise ValueError(f"Expected local state length >= {min_width}, got {q_local.shape[0]}")
+        q_full[block[:min_width]] = q_local[:min_width]
 
     def _extract_local_robot_state(self, q_full: np.ndarray, *, agent: str) -> np.ndarray:
         if agent == "A":
             block = self.q_block_a
+            width = 7 + self.robot_dof_a
         else:
             block = self.q_block_b
-        return np.asarray(q_full[block[: 7 + self.robot_dof]], dtype=np.float32)
+            width = 7 + self.robot_dof_b
+        return np.asarray(q_full[block[:width]], dtype=np.float32)
