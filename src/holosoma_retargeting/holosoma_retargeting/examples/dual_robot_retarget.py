@@ -51,6 +51,30 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
+# Right-handed y-up -> z-up coordinate transform, matching dual_joint_renderer.py.
+R_YUP_TO_ZUP = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+    ],
+    dtype=np.float32,
+)
+
+
+def _convert_y_up_to_z_up_points(points: np.ndarray) -> np.ndarray:
+    flat = points.reshape(-1, 3)
+    converted = (R_YUP_TO_ZUP @ flat.T).T
+    return converted.reshape(points.shape).astype(np.float32, copy=False)
+
+
+def _attach_qpos_coordinate_metadata(npz_path: Path, coordinate_frame: str = "z_up") -> None:
+    data = np.load(str(npz_path), allow_pickle=True)
+    payload = {key: data[key] for key in data.files}
+    payload["qpos_coordinate_frame"] = np.asarray(coordinate_frame)
+    np.savez(npz_path, **payload)
+
+
 def _build_dual_dense_joint_mapping(
     *,
     constants: SimpleNamespace,
@@ -127,6 +151,9 @@ class DualRetargetConfig:
 
     data_format: str = "smplx"
     """Motion data format used for joint naming/mapping."""
+
+    input_y_up_to_z_up: bool = True
+    """Apply right-handed y-up -> z-up conversion to dual-human joints before retargeting."""
 
     run_retarget: bool = False
     """If True, run independent A/B retargeting and save qpos outputs."""
@@ -292,6 +319,7 @@ def _run_single_agent_retarget_processed(
         original=True,
         dest_res_path=str(out_path),
     )
+    _attach_qpos_coordinate_metadata(out_path)
     return np.asarray(qpos, dtype=np.float32)
 
 
@@ -538,6 +566,13 @@ def main(cfg: DualRetargetConfig) -> None:
     logger.info("Robots (A/B): %s / %s", robot_config_a.robot_type, robot_config_b.robot_type)
     logger.info("Input source: %s", sequence_file)
 
+    human_a_retarget = human_a.copy()
+    human_b_retarget = human_b.copy()
+    if cfg.input_y_up_to_z_up:
+        human_a_retarget = _convert_y_up_to_z_up_points(human_a_retarget)
+        human_b_retarget = _convert_y_up_to_z_up_points(human_b_retarget)
+        logger.info("Applying right-handed y-up -> z-up conversion before retargeting.")
+
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     asset_root = Path(__file__).resolve().parents[1]
@@ -601,8 +636,8 @@ def main(cfg: DualRetargetConfig) -> None:
         logger.info("Using dual scene XML: %s", dual_scene_xml)
 
         human_a_processed, human_b_processed, foot_a, foot_b = _preprocess_dual_humans_for_coupled(
-            human_a=human_a,
-            human_b=human_b,
+            human_a=human_a_retarget,
+            human_b=human_b_retarget,
             scale_a=scale_a,
             scale_b=scale_b,
             toe_names_a=toe_names_a,
@@ -704,6 +739,7 @@ def main(cfg: DualRetargetConfig) -> None:
             q_init_b=q_init_b,
             dest_res_path=str(cfg.output_dir / f"{sequence_id}_dual_coupled_raw.npz"),
         )
+        _attach_qpos_coordinate_metadata(cfg.output_dir / f"{sequence_id}_dual_coupled_raw.npz")
 
         final_path = cfg.output_dir / f"{sequence_id}.npz"
         n = min(qpos_a.shape[0], qpos_b.shape[0], human_a.shape[0], human_b.shape[0])
@@ -725,6 +761,7 @@ def main(cfg: DualRetargetConfig) -> None:
             dual_scene_xml=str(dual_scene_xml),
             dual_prefix_A=cfg.dual_prefix_a,
             dual_prefix_B=cfg.dual_prefix_b,
+            qpos_coordinate_frame="z_up",
         )
         logger.info("Saved coupled dual retarget output: %s", final_path)
         return
@@ -734,7 +771,7 @@ def main(cfg: DualRetargetConfig) -> None:
 
     logger.info("Running independent retargeting for A (scale=%.4f)...", scale_a)
     qpos_a = _run_single_agent_retarget(
-        human_joints=human_a,
+        human_joints=human_a_retarget,
         smpl_scale=scale_a,
         toe_names=toe_names_a,
         constants=task_constants_a,
@@ -746,7 +783,7 @@ def main(cfg: DualRetargetConfig) -> None:
 
     logger.info("Running independent retargeting for B (scale=%.4f)...", scale_b)
     qpos_b = _run_single_agent_retarget(
-        human_joints=human_b,
+        human_joints=human_b_retarget,
         smpl_scale=scale_b,
         toe_names=toe_names_b,
         constants=task_constants_b,
@@ -773,6 +810,7 @@ def main(cfg: DualRetargetConfig) -> None:
         robot_B=robot_config_b.robot_type,
         data_format_A=motion_data_config_a.data_format,
         data_format_B=motion_data_config_b.data_format,
+        qpos_coordinate_frame="z_up",
     )
     logger.info("Saved dual Part-1 retarget output: %s", final_path)
 

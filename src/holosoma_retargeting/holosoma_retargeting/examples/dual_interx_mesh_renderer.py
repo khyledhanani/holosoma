@@ -401,16 +401,28 @@ def _convert_y_up_to_z_up_points(points: np.ndarray) -> np.ndarray:
     return converted.reshape(points.shape).astype(np.float32, copy=False)
 
 
-def _load_qpos_tracks(npz_path: Path, frame_stride: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+def _parse_coordinate_frame(value: object) -> str | None:
+    if isinstance(value, np.ndarray):
+        value = value.item()
+    frame = str(value).strip().lower()
+    if not frame:
+        return None
+    if frame not in {"y_up", "z_up"}:
+        raise ValueError(f"Unsupported coordinate frame metadata: {frame}")
+    return frame
+
+
+def _load_qpos_tracks(npz_path: Path, frame_stride: int) -> tuple[np.ndarray | None, np.ndarray | None, str | None]:
     data = np.load(str(npz_path), allow_pickle=True)
     stride = max(1, int(frame_stride))
+    qpos_frame = _parse_coordinate_frame(data["qpos_coordinate_frame"]) if "qpos_coordinate_frame" in data else None
     qpos_a = np.asarray(data["qpos_A"], dtype=np.float32)[::stride] if "qpos_A" in data else None
     qpos_b = np.asarray(data["qpos_B"], dtype=np.float32)[::stride] if "qpos_B" in data else None
     if qpos_a is not None and qpos_b is not None:
         n = min(qpos_a.shape[0], qpos_b.shape[0])
         qpos_a = qpos_a[:n]
         qpos_b = qpos_b[:n]
-    return qpos_a, qpos_b
+    return qpos_a, qpos_b, qpos_frame
 
 
 def _infer_robot_type(data: np.lib.npyio.NpzFile, key: str) -> str | None:
@@ -553,16 +565,23 @@ def main(cfg: Config) -> None:
     print(f"[dual_interx_mesh_renderer] y_up_to_z_up={cfg.y_up_to_z_up}")
 
     qpos_npz_path = Path(cfg.qpos_npz) if cfg.qpos_npz is not None else npz_path
-    qpos_a, qpos_b = _load_qpos_tracks(qpos_npz_path, cfg.frame_stride)
+    qpos_a, qpos_b, qpos_coordinate_frame = _load_qpos_tracks(qpos_npz_path, cfg.frame_stride)
     if cfg.show_robots:
         if qpos_a is None or qpos_b is None:
             raise ValueError(
                 f"show_robots=True but qpos_A/qpos_B were not found in {qpos_npz_path}. "
                 "Provide --qpos-npz pointing to a dual retarget output."
             )
-        if cfg.y_up_to_z_up:
+        should_convert_qpos = bool(cfg.y_up_to_z_up)
+        if qpos_coordinate_frame == "z_up":
+            should_convert_qpos = False
+        if should_convert_qpos:
             qpos_a = _convert_y_up_to_z_up_qpos(qpos_a)
             qpos_b = _convert_y_up_to_z_up_qpos(qpos_b)
+        print(
+            "[dual_interx_mesh_renderer] qpos_coordinate_frame="
+            f"{qpos_coordinate_frame or 'legacy_assumed_y_up'} | qpos_y_up_to_z_up_applied={should_convert_qpos}"
+        )
 
     server = viser.ViserServer()
     server.scene.add_grid("/grid", width=4.0, height=4.0, position=(0.0, 0.0, 0.0))
