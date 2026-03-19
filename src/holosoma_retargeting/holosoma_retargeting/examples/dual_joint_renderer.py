@@ -12,6 +12,11 @@ import viser  # type: ignore[import-not-found]
 import yourdfpy  # type: ignore[import-untyped]
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
 
+try:
+    from scipy.spatial import Delaunay  # type: ignore[import-untyped]
+except Exception:  # pragma: no cover - optional dependency at runtime
+    Delaunay = None
+
 
 # SMPL-X 22-joint body skeleton connectivity.
 SMPLX22_EDGES: list[tuple[int, int]] = [
@@ -37,6 +42,59 @@ SMPLX22_EDGES: list[tuple[int, int]] = [
     (18, 20),
     (19, 21),
 ]
+
+SMPLX22_JOINT_NAMES: list[str] = [
+    "Pelvis",
+    "L_Hip",
+    "R_Hip",
+    "Spine1",
+    "L_Knee",
+    "R_Knee",
+    "Spine2",
+    "L_Ankle",
+    "R_Ankle",
+    "Spine3",
+    "L_Foot",
+    "R_Foot",
+    "Neck",
+    "L_Collar",
+    "R_Collar",
+    "Head",
+    "L_Shoulder",
+    "R_Shoulder",
+    "L_Elbow",
+    "R_Elbow",
+    "L_Wrist",
+    "R_Wrist",
+]
+
+OPTIMIZER_CROSS_CRITICAL_NAMES = {
+    "L_Wrist",
+    "R_Wrist",
+    "L_Elbow",
+    "R_Elbow",
+    "L_Shoulder",
+    "R_Shoulder",
+}
+
+OPTIMIZER_CROSS_CONTACT_NAMES = {
+    "Pelvis",
+    "Spine",
+    "Spine1",
+    "Spine2",
+    "Spine3",
+    "Neck",
+    "L_Collar",
+    "R_Collar",
+    "L_Shoulder",
+    "R_Shoulder",
+    "L_Elbow",
+    "R_Elbow",
+    "L_Wrist",
+    "R_Wrist",
+    "L_Hip",
+    "R_Hip",
+}
 
 # Right-handed y-up -> z-up coordinate transform.
 # p_new = R_YUP_TO_ZUP @ p_old
@@ -77,6 +135,27 @@ class Config:
 
     show_skeleton: bool = True
     """Render skeleton edges in addition to joints."""
+
+    show_optimizer_graph: bool = False
+    """Render the dual retargeter's source graph edges on the first 22 SMPL-X joints."""
+
+    optimizer_graph_line_width: float = 1.0
+    """Line width for optimizer graph edges."""
+
+    optimizer_max_source_edge_len: float = 0.45
+    """Maximum intra-agent edge length, matching the dual optimizer default."""
+
+    optimizer_cross_agent_rescue_k: int = 3
+    """Fallback nearest-neighbor rescue count for cross-agent edges."""
+
+    optimizer_cross_agent_contact_threshold: float = 0.4
+    """Distance threshold for creating cross-agent contact edges."""
+
+    optimizer_cross_agent_contact_persist_threshold: float | None = None
+    """Persistence threshold for retaining cross-agent edges between frames."""
+
+    optimizer_cross_agent_contact_k: int = 2
+    """Maximum cross-agent neighbors to keep per source joint."""
 
     loop: bool = True
     """Loop playback."""
@@ -145,6 +224,235 @@ def _load_joint_trajectories(npz_path: Path, frame_stride: int) -> tuple[np.ndar
 
 def _edge_segments(joints: np.ndarray, edges: list[tuple[int, int]]) -> np.ndarray:
     return np.asarray([[joints[i], joints[j]] for i, j in edges], dtype=np.float32)
+
+
+def _empty_line_segments() -> np.ndarray:
+    return np.zeros((0, 2, 3), dtype=np.float32)
+
+
+def _line_segment_colors(num_segments: int, color: tuple[int, int, int]) -> np.ndarray:
+    if num_segments <= 0:
+        return np.zeros((0, 2, 3), dtype=np.uint8)
+    return np.tile(np.array([[color, color]], dtype=np.uint8), (num_segments, 1, 1))
+
+
+def _combined_edge_segments(
+    joints_a: np.ndarray,
+    joints_b: np.ndarray | None,
+    edges: list[tuple[int, int]],
+    *,
+    num_source_a: int,
+) -> np.ndarray:
+    if joints_b is None or not edges:
+        return _empty_line_segments()
+    combined = np.vstack([joints_a[:num_source_a], joints_b[:num_source_a]])
+    return np.asarray([[combined[i], combined[j]] for i, j in edges], dtype=np.float32)
+
+
+def _delaunay_tetrahedra(vertices: np.ndarray) -> np.ndarray:
+    if Delaunay is not None:
+        try:
+            return Delaunay(vertices).simplices
+        except Exception:
+            pass
+
+    n = vertices.shape[0]
+    if n < 4:
+        raise ValueError(f"Need at least 4 vertices to build optimizer graph tetrahedra, got {n}")
+    distances = np.linalg.norm(vertices[:, None, :] - vertices[None, :, :], axis=-1)
+    np.fill_diagonal(distances, np.inf)
+    simplices: list[list[int]] = []
+    for i in range(n):
+        nbrs = np.argsort(distances[i])[:3]
+        simplices.append([i, int(nbrs[0]), int(nbrs[1]), int(nbrs[2])])
+    return np.asarray(simplices, dtype=int)
+
+
+def _tetrahedra_to_edges(tetrahedra: np.ndarray) -> set[tuple[int, int]]:
+    edges: set[tuple[int, int]] = set()
+    for tet in tetrahedra:
+        a, b, c, d = [int(x) for x in tet]
+        for i, j in ((a, b), (a, c), (a, d), (b, c), (b, d), (c, d)):
+            edges.add((i, j) if i < j else (j, i))
+    return edges
+
+
+def _prune_long_edges(vertices: np.ndarray, edges: set[tuple[int, int]], max_len: float) -> set[tuple[int, int]]:
+    kept: set[tuple[int, int]] = set()
+    for i, j in edges:
+        if np.linalg.norm(vertices[i] - vertices[j]) <= max_len:
+            kept.add((i, j))
+    return kept
+
+
+def _build_intra_agent_optimizer_edges(vertices: np.ndarray, *, max_len: float, offset: int = 0) -> set[tuple[int, int]]:
+    tetrahedra = _delaunay_tetrahedra(vertices)
+    edges = _prune_long_edges(vertices, _tetrahedra_to_edges(tetrahedra), max_len)
+    if offset == 0:
+        return edges
+    return {(i + offset, j + offset) for i, j in edges}
+
+
+def _optimizer_cross_indices(num_source_a: int) -> tuple[list[int], list[int], list[int], list[int]]:
+    source_joint_names_a = SMPLX22_JOINT_NAMES[:num_source_a]
+    source_joint_names_b = SMPLX22_JOINT_NAMES[:num_source_a]
+    source_name_to_idx_a = {name: i for i, name in enumerate(source_joint_names_a)}
+    source_name_to_idx_b = {name: i for i, name in enumerate(source_joint_names_b)}
+
+    cross_rescue_a = [source_name_to_idx_a[name] for name in OPTIMIZER_CROSS_CRITICAL_NAMES if name in source_name_to_idx_a]
+    cross_rescue_b = [
+        num_source_a + source_name_to_idx_b[name] for name in OPTIMIZER_CROSS_CRITICAL_NAMES if name in source_name_to_idx_b
+    ]
+    cross_contact_a = [source_name_to_idx_a[name] for name in OPTIMIZER_CROSS_CONTACT_NAMES if name in source_name_to_idx_a]
+    cross_contact_b = [
+        num_source_a + source_name_to_idx_b[name] for name in OPTIMIZER_CROSS_CONTACT_NAMES if name in source_name_to_idx_b
+    ]
+    if not cross_contact_a:
+        cross_contact_a = list(range(num_source_a))
+    if not cross_contact_b:
+        cross_contact_b = list(range(num_source_a, 2 * num_source_a))
+    return cross_rescue_a, cross_rescue_b, cross_contact_a, cross_contact_b
+
+
+def _build_cross_agent_optimizer_edges(
+    vertices: np.ndarray,
+    *,
+    num_source_a: int,
+    prev_cross_edges: tuple[tuple[int, int], ...],
+    threshold: float,
+    persist_threshold: float,
+    contact_k: int,
+    rescue_k: int,
+) -> set[tuple[int, int]]:
+    cross_rescue_a, cross_rescue_b, cross_contact_a, cross_contact_b = _optimizer_cross_indices(num_source_a)
+    a_ids = np.asarray(cross_contact_a, dtype=int)
+    b_ids = np.asarray(cross_contact_b, dtype=int)
+    if a_ids.size == 0 or b_ids.size == 0:
+        return set()
+
+    dmat = np.linalg.norm(vertices[:, None, :] - vertices[None, :, :], axis=-1)
+    edges: set[tuple[int, int]] = set()
+
+    def _add_knn(src_ids: np.ndarray, dst_ids: np.ndarray, threshold_value: float) -> None:
+        for idx in src_ids:
+            distances = dmat[idx, dst_ids]
+            keep_mask = distances <= threshold_value
+            if not np.any(keep_mask):
+                continue
+            valid_dst = dst_ids[keep_mask]
+            valid_dist = distances[keep_mask]
+            order = np.argsort(valid_dist)[:contact_k]
+            for dst in valid_dst[order]:
+                i0, j0 = (int(idx), int(dst)) if int(idx) < int(dst) else (int(dst), int(idx))
+                edges.add((i0, j0))
+
+    _add_knn(a_ids, b_ids, threshold)
+    _add_knn(b_ids, a_ids, threshold)
+
+    for i, j in prev_cross_edges:
+        if i < 0 or j < 0 or i >= vertices.shape[0] or j >= vertices.shape[0]:
+            continue
+        if dmat[i, j] <= persist_threshold:
+            edges.add((i, j) if i < j else (j, i))
+
+    def _incident_cross_count(idx: int) -> int:
+        return sum(1 for i, j in edges if i == idx or j == idx)
+
+    for idx in cross_rescue_a:
+        if _incident_cross_count(idx) > 0:
+            continue
+        order = np.argsort(dmat[idx, b_ids])[:rescue_k]
+        for nearest in b_ids[order]:
+            nearest = int(nearest)
+            if dmat[idx, nearest] <= persist_threshold:
+                edges.add((idx, nearest) if idx < nearest else (nearest, idx))
+
+    for idx in cross_rescue_b:
+        if _incident_cross_count(idx) > 0:
+            continue
+        order = np.argsort(dmat[idx, a_ids])[:rescue_k]
+        for nearest in a_ids[order]:
+            nearest = int(nearest)
+            if dmat[idx, nearest] <= persist_threshold:
+                edges.add((nearest, idx) if nearest < idx else (idx, nearest))
+
+    return edges
+
+
+def _precompute_optimizer_graph_segments(
+    joints_a: np.ndarray,
+    joints_b: np.ndarray | None,
+    cfg: Config,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    n_frames = joints_a.shape[0]
+    num_source_a = min(22, joints_a.shape[1])
+    if num_source_a < 22:
+        raise ValueError(
+            "Optimizer graph overlay requires at least 22 joints in track A to match the dual retargeter source graph."
+        )
+    if joints_b is not None and joints_b.shape[1] < 22:
+        raise ValueError(
+            "Optimizer graph overlay requires at least 22 joints in track B to match the dual retargeter source graph."
+        )
+
+    persist_threshold = (
+        float(cfg.optimizer_cross_agent_contact_persist_threshold)
+        if cfg.optimizer_cross_agent_contact_persist_threshold is not None
+        else max(
+            float(cfg.optimizer_cross_agent_contact_threshold) * 1.25,
+            float(cfg.optimizer_cross_agent_contact_threshold) + 0.08,
+        )
+    )
+
+    a_segments_by_frame: list[np.ndarray] = []
+    b_segments_by_frame: list[np.ndarray] = []
+    cross_segments_by_frame: list[np.ndarray] = []
+    prev_cross_edges: tuple[tuple[int, int], ...] = tuple()
+
+    for frame_idx in range(n_frames):
+        points_a = joints_a[frame_idx, :num_source_a]
+        intra_edges_a = sorted(
+            _build_intra_agent_optimizer_edges(
+                points_a,
+                max_len=float(cfg.optimizer_max_source_edge_len),
+            )
+        )
+        a_segments_by_frame.append(_edge_segments(points_a, intra_edges_a) if intra_edges_a else _empty_line_segments())
+
+        if joints_b is None:
+            b_segments_by_frame.append(_empty_line_segments())
+            cross_segments_by_frame.append(_empty_line_segments())
+            continue
+
+        points_b = joints_b[frame_idx, :num_source_a]
+        intra_edges_b = sorted(
+            _build_intra_agent_optimizer_edges(
+                points_b,
+                max_len=float(cfg.optimizer_max_source_edge_len),
+            )
+        )
+        b_segments_by_frame.append(_edge_segments(points_b, intra_edges_b) if intra_edges_b else _empty_line_segments())
+
+        combined = np.vstack([points_a, points_b])
+        cross_edges = sorted(
+            _build_cross_agent_optimizer_edges(
+                combined,
+                num_source_a=num_source_a,
+                prev_cross_edges=prev_cross_edges,
+                threshold=float(cfg.optimizer_cross_agent_contact_threshold),
+                persist_threshold=persist_threshold,
+                contact_k=max(1, int(cfg.optimizer_cross_agent_contact_k)),
+                rescue_k=max(1, int(cfg.optimizer_cross_agent_rescue_k)),
+            )
+        )
+        prev_cross_edges = tuple(cross_edges)
+        cross_segments_by_frame.append(
+            _combined_edge_segments(points_a, points_b, cross_edges, num_source_a=num_source_a)
+            if cross_edges
+            else _empty_line_segments()
+        )
+
+    return a_segments_by_frame, b_segments_by_frame, cross_segments_by_frame
 
 
 def _convert_y_up_to_z_up_points(points: np.ndarray) -> np.ndarray:
@@ -255,6 +563,23 @@ def main(cfg: Config) -> None:
     print(f"[dual_joint_renderer] rendering {'dual' if joints_b is not None else 'single'} tracks")
     print(f"[dual_joint_renderer] y_up_to_z_up={cfg.y_up_to_z_up}")
 
+    optimizer_graph_a = None
+    optimizer_graph_b = None
+    optimizer_graph_cross = None
+    if cfg.show_optimizer_graph:
+        optimizer_graph_a, optimizer_graph_b, optimizer_graph_cross = _precompute_optimizer_graph_segments(
+            joints_a=joints_a,
+            joints_b=joints_b,
+            cfg=cfg,
+        )
+        cross_counts = [segments.shape[0] for segments in optimizer_graph_cross]
+        print(
+            "[dual_joint_renderer] optimizer_graph="
+            f"enabled | frames={len(optimizer_graph_a)}"
+            f" | mean_cross_edges={float(np.mean(cross_counts)) if cross_counts else 0.0:.2f}"
+            f" | max_cross_edges={max(cross_counts) if cross_counts else 0}"
+        )
+
     qpos_npz_path = Path(cfg.qpos_npz) if cfg.qpos_npz is not None else npz_path
     qpos_a, qpos_b, qpos_coordinate_frame = _load_qpos_tracks(qpos_npz_path, cfg.frame_stride)
     if cfg.show_robots:
@@ -293,8 +618,17 @@ def main(cfg: Config) -> None:
         a_lines_handle = server.scene.add_line_segments(
             "/humans/A/skeleton",
             points=_edge_segments(joints_a[0], SMPLX22_EDGES),
-            colors=np.tile(np.array([[[0, 180, 230], [0, 180, 230]]], dtype=np.uint8), (len(SMPLX22_EDGES), 1, 1)),
+            colors=_line_segment_colors(len(SMPLX22_EDGES), (0, 180, 230)),
             line_width=cfg.line_width,
+        )
+    a_optimizer_handle = None
+    if optimizer_graph_a is not None:
+        a_optimizer_handle = server.scene.add_line_segments(
+            "/humans/A/optimizer_graph",
+            points=optimizer_graph_a[0],
+            colors=_line_segment_colors(optimizer_graph_a[0].shape[0], (100, 230, 255)),
+            line_width=float(cfg.optimizer_graph_line_width),
+            visible=cfg.show_optimizer_graph,
         )
 
     # Human B (orange), optional.
@@ -312,12 +646,32 @@ def main(cfg: Config) -> None:
             b_lines_handle = server.scene.add_line_segments(
                 "/humans/B/skeleton",
                 points=_edge_segments(joints_b[0], SMPLX22_EDGES),
-                colors=np.tile(
-                    np.array([[[230, 140, 0], [230, 140, 0]]], dtype=np.uint8),
-                    (len(SMPLX22_EDGES), 1, 1),
-                ),
+                colors=_line_segment_colors(len(SMPLX22_EDGES), (230, 140, 0)),
                 line_width=cfg.line_width,
             )
+        if optimizer_graph_b is not None:
+            b_optimizer_handle = server.scene.add_line_segments(
+                "/humans/B/optimizer_graph",
+                points=optimizer_graph_b[0],
+                colors=_line_segment_colors(optimizer_graph_b[0].shape[0], (255, 190, 70)),
+                line_width=float(cfg.optimizer_graph_line_width),
+                visible=cfg.show_optimizer_graph,
+            )
+        else:
+            b_optimizer_handle = None
+        if optimizer_graph_cross is not None:
+            cross_optimizer_handle = server.scene.add_line_segments(
+                "/humans/cross_optimizer_graph",
+                points=optimizer_graph_cross[0],
+                colors=_line_segment_colors(optimizer_graph_cross[0].shape[0], (255, 90, 90)),
+                line_width=float(cfg.optimizer_graph_line_width),
+                visible=cfg.show_optimizer_graph,
+            )
+        else:
+            cross_optimizer_handle = None
+    else:
+        b_optimizer_handle = None
+        cross_optimizer_handle = None
 
     # Optional robot overlays (A and B) from qpos_A/qpos_B.
     robot_a = None
@@ -367,6 +721,48 @@ def main(cfg: Config) -> None:
             step=0.001,
             initial_value=cfg.point_size,
         )
+        show_skeleton_cb = server.gui.add_checkbox("Show skeleton", initial_value=cfg.show_skeleton)
+        if a_lines_handle is not None:
+            a_lines_handle.visible = bool(show_skeleton_cb.value)
+        if b_lines_handle is not None:
+            b_lines_handle.visible = bool(show_skeleton_cb.value)
+
+        @show_skeleton_cb.on_update
+        def _(_event) -> None:
+            if a_lines_handle is not None:
+                a_lines_handle.visible = bool(show_skeleton_cb.value)
+            if b_lines_handle is not None:
+                b_lines_handle.visible = bool(show_skeleton_cb.value)
+
+        if optimizer_graph_a is not None:
+            show_optimizer_graph_cb = server.gui.add_checkbox(
+                "Show optimizer graph",
+                initial_value=cfg.show_optimizer_graph,
+            )
+            optimizer_line_width_slider = server.gui.add_slider(
+                "Optimizer line width",
+                min=0.25,
+                max=6.0,
+                step=0.05,
+                initial_value=float(cfg.optimizer_graph_line_width),
+            )
+
+            if a_optimizer_handle is not None:
+                a_optimizer_handle.visible = bool(show_optimizer_graph_cb.value)
+            if b_optimizer_handle is not None:
+                b_optimizer_handle.visible = bool(show_optimizer_graph_cb.value)
+            if cross_optimizer_handle is not None:
+                cross_optimizer_handle.visible = bool(show_optimizer_graph_cb.value)
+
+            @show_optimizer_graph_cb.on_update
+            def _(_event) -> None:
+                if a_optimizer_handle is not None:
+                    a_optimizer_handle.visible = bool(show_optimizer_graph_cb.value)
+                if b_optimizer_handle is not None:
+                    b_optimizer_handle.visible = bool(show_optimizer_graph_cb.value)
+                if cross_optimizer_handle is not None:
+                    cross_optimizer_handle.visible = bool(show_optimizer_graph_cb.value)
+
         if cfg.show_robots:
             show_robot_meshes_cb = server.gui.add_checkbox("Show robot meshes", initial_value=True)
 
@@ -383,11 +779,25 @@ def main(cfg: Config) -> None:
         a_joints_handle.point_size = float(point_size_slider.value)
         if a_lines_handle is not None:
             a_lines_handle.points = _edge_segments(joints_a[i], SMPLX22_EDGES)
+            a_lines_handle.line_width = float(cfg.line_width)
+        if a_optimizer_handle is not None and optimizer_graph_a is not None:
+            a_optimizer_handle.points = optimizer_graph_a[i]
+            a_optimizer_handle.colors = _line_segment_colors(optimizer_graph_a[i].shape[0], (100, 230, 255))
+            a_optimizer_handle.line_width = float(optimizer_line_width_slider.value)
         if joints_b is not None and b_joints_handle is not None:
             b_joints_handle.points = joints_b[i]
             b_joints_handle.point_size = float(point_size_slider.value)
         if joints_b is not None and b_lines_handle is not None:
             b_lines_handle.points = _edge_segments(joints_b[i], SMPLX22_EDGES)
+            b_lines_handle.line_width = float(cfg.line_width)
+        if joints_b is not None and b_optimizer_handle is not None and optimizer_graph_b is not None:
+            b_optimizer_handle.points = optimizer_graph_b[i]
+            b_optimizer_handle.colors = _line_segment_colors(optimizer_graph_b[i].shape[0], (255, 190, 70))
+            b_optimizer_handle.line_width = float(optimizer_line_width_slider.value)
+        if cross_optimizer_handle is not None and optimizer_graph_cross is not None:
+            cross_optimizer_handle.points = optimizer_graph_cross[i]
+            cross_optimizer_handle.colors = _line_segment_colors(optimizer_graph_cross[i].shape[0], (255, 90, 90))
+            cross_optimizer_handle.line_width = float(optimizer_line_width_slider.value)
 
         if cfg.show_robots and qpos_a is not None and robot_a is not None and robot_a_root is not None and robot_dof_a is not None:
             qa = qpos_a[i]
