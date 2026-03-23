@@ -5,6 +5,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+from typing import Literal
 
 import numpy as np
 import tyro
@@ -16,6 +18,12 @@ try:
     from scipy.spatial import Delaunay  # type: ignore[import-untyped]
 except Exception:  # pragma: no cover - optional dependency at runtime
     Delaunay = None
+
+src_root = Path(__file__).resolve().parents[2]
+if str(src_root) not in sys.path:
+    sys.path.insert(0, str(src_root))
+
+from holosoma_retargeting.config_types.data_type import MotionDataConfig
 
 
 # SMPL-X 22-joint body skeleton connectivity.
@@ -121,6 +129,15 @@ class Config:
     data_npz: str
     """Path to an Inter-X joint npz file (dual or single)."""
 
+    port: int = 8080
+    """Port for the Viser server."""
+
+    prefer_optimization_joints: bool = True
+    """Prefer the resized/preprocessed joints used by the optimizer when available."""
+
+    joint_scale_mode: Literal["individual", "unified"] = "individual"
+    """Choose whether to render individually-scaled optimizer joints (P_ind) or unified-scale joints (P_uni)."""
+
     fps_override: float | None = None
     """Optional FPS override. If None, use fps from npz (default 30 if absent)."""
 
@@ -181,7 +198,14 @@ class Config:
 
 def _load_joint_trajectories(npz_path: Path, frame_stride: int) -> tuple[np.ndarray, np.ndarray | None, float, str]:
     data = np.load(str(npz_path), allow_pickle=True)
+    return _extract_joint_trajectories(data, npz_path.stem, frame_stride)
 
+
+def _extract_joint_trajectories(
+    data: np.lib.npyio.NpzFile,
+    fallback_sequence_id: str,
+    frame_stride: int,
+) -> tuple[np.ndarray, np.ndarray | None, float, str]:
     # Support both raw and processed dual naming.
     if "human_joints_A" in data and "human_joints_B" in data:
         joints_a = np.asarray(data["human_joints_A"], dtype=np.float32)
@@ -218,8 +242,192 @@ def _load_joint_trajectories(npz_path: Path, frame_stride: int) -> tuple[np.ndar
     fps = float(data["fps"]) if "fps" in data else 30.0
     if stride > 1:
         fps = fps / stride
-    sequence_id = str(data["sequence_id"]) if "sequence_id" in data else npz_path.stem
+    sequence_id = str(data["sequence_id"]) if "sequence_id" in data else fallback_sequence_id
     return joints_a, joints_b, fps, sequence_id
+
+
+def _coerce_scalar_string(value: object) -> str | None:
+    if isinstance(value, np.ndarray):
+        value = value.item()
+    text = str(value).strip()
+    return text or None
+
+
+def _coerce_scalar_float(data: np.lib.npyio.NpzFile | None, key: str) -> float | None:
+    if data is None or key not in data:
+        return None
+    return float(np.asarray(data[key]).item())
+
+
+def _resolve_joint_scales(
+    *,
+    data_npz: np.lib.npyio.NpzFile,
+    qpos_data: np.lib.npyio.NpzFile | None,
+    mode: Literal["individual", "unified"],
+    has_b: bool,
+) -> tuple[float, float | None, str]:
+    if mode == "individual":
+        scale_a = _coerce_scalar_float(qpos_data, "scale_A")
+        if scale_a is None:
+            scale_a = _coerce_scalar_float(data_npz, "scale_A")
+        scale_b = _coerce_scalar_float(qpos_data, "scale_B")
+        if scale_b is None:
+            scale_b = _coerce_scalar_float(data_npz, "scale_B")
+        if scale_a is None or (has_b and scale_b is None):
+            raise ValueError(
+                "joint_scale_mode='individual' requires scale_A/scale_B in either --data_npz or --qpos_npz."
+            )
+        return scale_a, scale_b, "P_ind"
+
+    scale_uni = _coerce_scalar_float(qpos_data, "scale_uni")
+    if scale_uni is None:
+        scale_uni = _coerce_scalar_float(data_npz, "scale_uni")
+    if scale_uni is None:
+        raise ValueError(
+            "joint_scale_mode='unified' requires scale_uni in either --data_npz or --qpos_npz."
+        )
+    return scale_uni, scale_uni if has_b else None, "P_uni"
+
+
+def _resolve_motion_metadata(
+    *,
+    data_npz: np.lib.npyio.NpzFile,
+    qpos_data: np.lib.npyio.NpzFile | None,
+    suffix: str,
+) -> tuple[str, str]:
+    data_format = _coerce_scalar_string(qpos_data[f"data_format_{suffix}"]) if qpos_data is not None and f"data_format_{suffix}" in qpos_data else None
+    if data_format is None and f"data_format_{suffix}" in data_npz:
+        data_format = _coerce_scalar_string(data_npz[f"data_format_{suffix}"])
+    robot = _coerce_scalar_string(qpos_data[f"robot_{suffix}"]) if qpos_data is not None and f"robot_{suffix}" in qpos_data else None
+    if robot is None and f"robot_{suffix}" in data_npz:
+        robot = _coerce_scalar_string(data_npz[f"robot_{suffix}"])
+    return data_format or "smplx", robot or "g1"
+
+
+def _normalize_height_and_scale(
+    joints: np.ndarray,
+    *,
+    demo_joints: list[str],
+    toe_names: list[str],
+    scale: float,
+    mat_height: float = 0.1,
+) -> np.ndarray:
+    joints_scaled = np.array(joints, dtype=np.float32, copy=True)
+    toe_indices = [demo_joints.index(name) for name in toe_names if name in demo_joints]
+    if toe_indices:
+        z_min = float(joints_scaled[:, toe_indices, 2].min())
+        if z_min >= mat_height:
+            z_min -= mat_height
+        joints_scaled[:, :, 2] -= z_min
+    joints_scaled *= float(scale)
+    return joints_scaled
+
+
+def _reconstruct_optimizer_joints_from_scales(
+    data_joints_a: np.ndarray,
+    data_joints_b: np.ndarray | None,
+    data_npz: np.lib.npyio.NpzFile,
+    qpos_data: np.lib.npyio.NpzFile | None,
+    *,
+    raw_y_up_to_z_up: bool,
+    joint_scale_mode: Literal["individual", "unified"],
+) -> tuple[np.ndarray, np.ndarray | None, str]:
+    scale_a, scale_b, scale_label = _resolve_joint_scales(
+        data_npz=data_npz,
+        qpos_data=qpos_data,
+        mode=joint_scale_mode,
+        has_b=data_joints_b is not None,
+    )
+
+    joints_a_input = _convert_y_up_to_z_up_points(data_joints_a) if raw_y_up_to_z_up else data_joints_a
+    data_format_a, robot_a = _resolve_motion_metadata(data_npz=data_npz, qpos_data=qpos_data, suffix="A")
+    motion_cfg_a = MotionDataConfig(data_format=data_format_a or "smplx", robot_type=robot_a or "g1")
+    joints_a = _normalize_height_and_scale(
+        joints_a_input,
+        demo_joints=motion_cfg_a.resolved_demo_joints,
+        toe_names=motion_cfg_a.toe_names,
+        scale=scale_a,
+    )
+
+    joints_b: np.ndarray | None = None
+    if data_joints_b is not None:
+        if scale_b is None:
+            raise ValueError(f"Missing scale for track B in joint_scale_mode='{joint_scale_mode}'.")
+        joints_b_input = _convert_y_up_to_z_up_points(data_joints_b) if raw_y_up_to_z_up else data_joints_b
+        data_format_b, robot_b = _resolve_motion_metadata(data_npz=data_npz, qpos_data=qpos_data, suffix="B")
+        motion_cfg_b = MotionDataConfig(data_format=data_format_b or "smplx", robot_type=robot_b or "g1")
+        joints_b = _normalize_height_and_scale(
+            joints_b_input,
+            demo_joints=motion_cfg_b.resolved_demo_joints,
+            toe_names=motion_cfg_b.toe_names,
+            scale=scale_b,
+        )
+
+    return joints_a, joints_b, scale_label
+
+
+def _load_render_joint_trajectories(
+    data_npz_path: Path,
+    qpos_npz_path: Path | None,
+    frame_stride: int,
+    prefer_optimization_joints: bool,
+    raw_y_up_to_z_up: bool,
+    joint_scale_mode: Literal["individual", "unified"],
+) -> tuple[np.ndarray, np.ndarray | None, float, str, str | None, str]:
+    data_npz = np.load(str(data_npz_path), allow_pickle=True)
+    qpos_data = np.load(str(qpos_npz_path), allow_pickle=True) if qpos_npz_path is not None else None
+    data_joint_coordinate_frame = (
+        _parse_coordinate_frame(data_npz["qpos_coordinate_frame"])
+        if "qpos_coordinate_frame" in data_npz
+        else ("z_up" if "scale_uni" in data_npz else None)
+    )
+
+    if prefer_optimization_joints and qpos_data is not None:
+        try:
+            joints_a, joints_b, fps, sequence_id = _extract_joint_trajectories(qpos_data, qpos_npz_path.stem, frame_stride)
+            try:
+                scale_a, scale_b, scale_label = _resolve_joint_scales(
+                    data_npz=data_npz,
+                    qpos_data=qpos_data,
+                    mode=joint_scale_mode,
+                    has_b=joints_b is not None,
+                )
+                joints_a = joints_a * scale_a
+                if joints_b is not None and scale_b is not None:
+                    joints_b = joints_b * scale_b
+                source = f"qpos_npz:{scale_label}"
+            except ValueError:
+                if joint_scale_mode != "individual":
+                    raise
+                source = "qpos_npz:processed_joints"
+            joint_coordinate_frame = (
+                _parse_coordinate_frame(qpos_data["qpos_coordinate_frame"])
+                if "qpos_coordinate_frame" in qpos_data
+                else None
+            )
+            return joints_a, joints_b, fps, sequence_id, joint_coordinate_frame, source
+        except KeyError:
+            pass
+
+    data_joints_a, data_joints_b, fps, sequence_id = _extract_joint_trajectories(data_npz, data_npz_path.stem, frame_stride)
+
+    if prefer_optimization_joints and qpos_data is not None:
+        joints_a, joints_b, scale_label = _reconstruct_optimizer_joints_from_scales(
+            data_joints_a,
+            data_joints_b,
+            data_npz,
+            qpos_data,
+            raw_y_up_to_z_up=raw_y_up_to_z_up and data_joint_coordinate_frame != "z_up",
+            joint_scale_mode=joint_scale_mode,
+        )
+        joint_coordinate_frame = (
+            _parse_coordinate_frame(qpos_data["qpos_coordinate_frame"])
+            if "qpos_coordinate_frame" in qpos_data
+            else ("z_up" if raw_y_up_to_z_up else None)
+        )
+        return joints_a, joints_b, fps, sequence_id, joint_coordinate_frame, f"data_npz+qpos_scales:{scale_label}"
+
+    return data_joints_a, data_joints_b, fps, sequence_id, data_joint_coordinate_frame, "data_npz:raw_joints"
 
 
 def _edge_segments(joints: np.ndarray, edges: list[tuple[int, int]]) -> np.ndarray:
@@ -550,8 +758,19 @@ def _convert_y_up_to_z_up_qpos(qpos: np.ndarray) -> np.ndarray:
 
 def main(cfg: Config) -> None:
     npz_path = Path(cfg.data_npz)
-    joints_a, joints_b, fps_from_data, sequence_id = _load_joint_trajectories(npz_path, cfg.frame_stride)
-    if cfg.y_up_to_z_up:
+    qpos_npz_path = Path(cfg.qpos_npz) if cfg.qpos_npz is not None else npz_path
+    joints_a, joints_b, fps_from_data, sequence_id, joint_coordinate_frame, joint_source = _load_render_joint_trajectories(
+        data_npz_path=npz_path,
+        qpos_npz_path=qpos_npz_path if qpos_npz_path.exists() else None,
+        frame_stride=cfg.frame_stride,
+        prefer_optimization_joints=cfg.prefer_optimization_joints,
+        raw_y_up_to_z_up=bool(cfg.y_up_to_z_up),
+        joint_scale_mode=cfg.joint_scale_mode,
+    )
+    should_convert_joints = bool(cfg.y_up_to_z_up)
+    if joint_coordinate_frame == "z_up":
+        should_convert_joints = False
+    if should_convert_joints:
         joints_a = _convert_y_up_to_z_up_points(joints_a)
         if joints_b is not None:
             joints_b = _convert_y_up_to_z_up_points(joints_b)
@@ -561,7 +780,11 @@ def main(cfg: Config) -> None:
     n_frames, n_joints, _ = joints_a.shape
     print(f"[dual_joint_renderer] sequence={sequence_id} frames={n_frames} joints={n_joints} fps={fps:.2f}")
     print(f"[dual_joint_renderer] rendering {'dual' if joints_b is not None else 'single'} tracks")
-    print(f"[dual_joint_renderer] y_up_to_z_up={cfg.y_up_to_z_up}")
+    print(
+        "[dual_joint_renderer] joint_source="
+        f"{joint_source} | joint_coordinate_frame={joint_coordinate_frame or 'assumed_y_up'}"
+        f" | joints_y_up_to_z_up_applied={should_convert_joints}"
+    )
 
     optimizer_graph_a = None
     optimizer_graph_b = None
@@ -580,7 +803,6 @@ def main(cfg: Config) -> None:
             f" | max_cross_edges={max(cross_counts) if cross_counts else 0}"
         )
 
-    qpos_npz_path = Path(cfg.qpos_npz) if cfg.qpos_npz is not None else npz_path
     qpos_a, qpos_b, qpos_coordinate_frame = _load_qpos_tracks(qpos_npz_path, cfg.frame_stride)
     if cfg.show_robots:
         if qpos_a is None:
@@ -602,7 +824,7 @@ def main(cfg: Config) -> None:
             f"{qpos_coordinate_frame or 'legacy_assumed_y_up'} | qpos_y_up_to_z_up_applied={should_convert_qpos}"
         )
 
-    server = viser.ViserServer()
+    server = viser.ViserServer(port=cfg.port)
     server.scene.add_grid("/grid", width=4.0, height=4.0, position=(0.0, 0.0, 0.0))
 
     # Human A (cyan)
