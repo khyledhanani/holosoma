@@ -18,6 +18,8 @@ class RobotDefaults(TypedDict):
 _ROBOT_DEFAULTS: dict[str, RobotDefaults] = {
     "g1": {"robot_dof": 29, "robot_height": 1.32, "object_name": "ground"},
     "t1": {"robot_dof": 23, "robot_height": 1.2, "object_name": "ground"},
+    # MuJoCo articulated human model (SMPL-X style kinematic tree).
+    "smplx_humanoid": {"robot_dof": 153, "robot_height": 1.78, "object_name": "ground"},
 }
 
 
@@ -121,6 +123,10 @@ class RobotConfig:
         """Get robot URDF file path."""
         if self.robot_urdf_file is not None:
             return self.robot_urdf_file
+        if self.robot_type == "smplx_humanoid":
+            # This path intentionally points to MuJoCo XML; downstream loaders
+            # already accept XML paths directly.
+            return "models/mujoco_models/converted_model_test.xml"
         return f"models/{self.robot_type}/{self.robot_type}_{self.ROBOT_DOF}dof.urdf"
 
     ROBOT_URDF_FILE = property(_robot_urdf_file, doc="Get robot URDF file path.")
@@ -154,6 +160,8 @@ class RobotConfig:
                 "left_foot_sphere_5_link",
                 "right_foot_sphere_5_link",
             ]
+        if self.robot_type == "smplx_humanoid":
+            return ["L_Toe", "R_Toe"]
         raise ValueError(f"Invalid robot type: {self.robot_type}")
 
     FOOT_STICKING_LINKS = property(

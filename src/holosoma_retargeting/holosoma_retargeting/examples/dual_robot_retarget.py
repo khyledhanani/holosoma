@@ -19,7 +19,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from copy import deepcopy
+from typing import Literal
 
+import mujoco
 import numpy as np
 import tyro
 
@@ -49,6 +51,9 @@ from holosoma_retargeting.src.utils import (
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+HUMAN_MODEL_ROBOT_TYPE = "smplx_humanoid"
 
 
 # Right-handed y-up -> z-up coordinate transform, matching dual_joint_renderer.py.
@@ -148,6 +153,25 @@ class DualRetargetConfig:
 
     robot_b: str | None = None
     """Optional robot type for agent B (overrides `robot`)."""
+
+    target_mode: Literal["robot_to_robot", "human_to_robot", "human_to_human"] = "robot_to_robot"
+    """High-level dual mode:
+    - robot_to_robot: both sides use robot types
+    - human_to_robot: one side uses an articulated human model
+    - human_to_human: both sides use articulated human models
+    """
+
+    robot_side: Literal["A", "B"] = "A"
+    """For human_to_robot mode: which side should remain a robot target."""
+
+    human_model_robot_type: str = HUMAN_MODEL_ROBOT_TYPE
+    """Robot-type token used for articulated human constants/mapping."""
+
+    human_model_xml: Path = Path("models/mujoco_models/converted_model_test.xml")
+    """MuJoCo XML for the articulated human model used in optimization."""
+
+    human_model_height: float = 1.78
+    """Nominal height for articulated human scaling in preprocessing."""
 
     data_format: str = "smplx"
     """Motion data format used for joint naming/mapping."""
@@ -388,7 +412,11 @@ def _absolutize_file_paths(root: ET.Element, single_xml_path: Path) -> None:
         if file_path.is_absolute():
             continue
         if node.tag in {"mesh", "texture", "hfield", "heightfield"}:
-            abs_path = (mesh_base / file_path).resolve()
+            # Some XMLs already encode "assets/..." in file paths even when a
+            # meshdir/assets base is present. Prefer whichever candidate exists.
+            candidate_mesh = (mesh_base / file_path).resolve()
+            candidate_local = (single_xml_path.parent / file_path).resolve()
+            abs_path = candidate_mesh if candidate_mesh.exists() else candidate_local
         else:
             abs_path = (single_xml_path.parent / file_path).resolve()
         node.set("file", str(abs_path))
@@ -406,6 +434,20 @@ def _append_section_children(dst_root: ET.Element, src_root: ET.Element, section
     src_sections = src_root.findall(section_tag)
     if not src_sections:
         return
+    if section_tag == "default":
+        dst_section = dst_root.find(section_tag)
+        if dst_section is None:
+            dst_section = ET.SubElement(dst_root, section_tag)
+        for src_section in src_sections:
+            if src_section.attrib:
+                nested_default = ET.SubElement(dst_section, "default", attrib=deepcopy(src_section.attrib))
+                for child in list(src_section):
+                    nested_default.append(deepcopy(child))
+            else:
+                for child in list(src_section):
+                    dst_section.append(deepcopy(child))
+        return
+
     dst_section = dst_root.find(section_tag)
     if dst_section is None:
         dst_section = ET.SubElement(dst_root, section_tag)
@@ -428,7 +470,9 @@ def _build_dual_scene_xml_from_pair(
 
     # Keep singleton sections from A first, then B as fallback.
     for singleton_tag in ("compiler", "option", "size", "visual", "statistic"):
-        singleton = root_a.find(singleton_tag) or root_b.find(singleton_tag)
+        singleton = root_a.find(singleton_tag)
+        if singleton is None:
+            singleton = root_b.find(singleton_tag)
         if singleton is not None:
             merged_root.append(deepcopy(singleton))
 
@@ -440,7 +484,10 @@ def _build_dual_scene_xml_from_pair(
     if worldbody is None:
         raise ValueError("Merged dual scene has no worldbody section.")
 
-    freejoint_roots = [child for child in list(worldbody) if child.tag == "body" and child.find("freejoint") is not None]
+    def _is_free_root_body(body: ET.Element) -> bool:
+        return body.find("freejoint") is not None or body.find("joint[@type='free']") is not None
+
+    freejoint_roots = [child for child in list(worldbody) if child.tag == "body" and _is_free_root_body(child)]
     if len(freejoint_roots) < 2:
         raise ValueError(
             f"Expected at least two root freejoint bodies in merged dual scene, got {len(freejoint_roots)}."
@@ -481,13 +528,21 @@ def _preprocess_dual_humans_for_coupled(
 
 
 def _resolve_asset_paths(constants: SimpleNamespace, asset_root: Path) -> None:
+    project_root = Path(__file__).resolve().parents[4]
+
     def _to_abs(path_value: str | None) -> str | None:
         if path_value is None:
             return None
         p = Path(path_value)
         if p.is_absolute():
             return str(p)
-        return str(asset_root / p)
+        candidate_asset = (asset_root / p).resolve()
+        if candidate_asset.exists():
+            return str(candidate_asset)
+        candidate_project = (project_root / p).resolve()
+        if candidate_project.exists():
+            return str(candidate_project)
+        return str(candidate_asset)
 
     constants.ROBOT_URDF_FILE = _to_abs(getattr(constants, "ROBOT_URDF_FILE", None))
     constants.OBJECT_URDF_FILE = _to_abs(getattr(constants, "OBJECT_URDF_FILE", None))
@@ -496,28 +551,100 @@ def _resolve_asset_paths(constants: SimpleNamespace, asset_root: Path) -> None:
         constants.SCENE_XML_FILE = _to_abs(getattr(constants, "SCENE_XML_FILE", None))
 
 
+def _resolve_agent_robot_types(cfg: object) -> tuple[str, str]:
+    fallback_robot = str(getattr(cfg, "robot", "g1"))
+    robot_type_a_cfg = getattr(cfg, "robot_a", None)
+    robot_type_b_cfg = getattr(cfg, "robot_b", None)
+    target_mode = str(getattr(cfg, "target_mode", "robot_to_robot")).strip().lower()
+    human_type = str(getattr(cfg, "human_model_robot_type", HUMAN_MODEL_ROBOT_TYPE))
+
+    if target_mode == "human_to_human":
+        return human_type, human_type
+
+    if target_mode == "human_to_robot":
+        robot_side = str(getattr(cfg, "robot_side", "A")).strip().upper()
+        if robot_side not in {"A", "B"}:
+            raise ValueError(f"robot_side must be 'A' or 'B', got {robot_side!r}")
+        if robot_side == "A":
+            return str(robot_type_a_cfg or fallback_robot), human_type
+        return human_type, str(robot_type_b_cfg or fallback_robot)
+
+    # Default: explicit per-agent overrides if provided, else shared robot.
+    return str(robot_type_a_cfg or fallback_robot), str(robot_type_b_cfg or fallback_robot)
+
+
+def _resolve_human_model_xml(cfg: object) -> Path:
+    raw = getattr(cfg, "human_model_xml", Path("models/mujoco_models/converted_model_test.xml"))
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    project_root = Path(__file__).resolve().parents[4]
+    candidate_project = (project_root / p).resolve()
+    if candidate_project.exists():
+        return candidate_project
+    return (Path(__file__).resolve().parents[1] / p).resolve()
+
+
+def _infer_robot_dof_from_model_xml(model_xml: Path) -> int:
+    model = mujoco.MjModel.from_xml_path(str(model_xml))
+    free_joint_ids = [j for j in range(model.njnt) if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE]
+    if not free_joint_ids:
+        raise ValueError(f"Model has no free joint root: {model_xml}")
+    free_qadr = sorted(int(model.jnt_qposadr[j]) for j in free_joint_ids)
+    q_start = free_qadr[0]
+    q_end = free_qadr[1] if len(free_qadr) > 1 else int(model.nq)
+    width = q_end - q_start
+    if width < 7:
+        raise ValueError(f"Expected free-joint block width >= 7 for {model_xml}, got {width}")
+    return int(width - 7)
+
+
+def _apply_human_model_overrides(robot_config: RobotConfig, cfg: object) -> RobotConfig:
+    human_type = str(getattr(cfg, "human_model_robot_type", HUMAN_MODEL_ROBOT_TYPE))
+    if robot_config.robot_type != human_type:
+        return robot_config
+
+    human_xml = _resolve_human_model_xml(cfg)
+    if not human_xml.exists():
+        raise FileNotFoundError(f"Human model XML does not exist: {human_xml}")
+    human_dof = _infer_robot_dof_from_model_xml(human_xml)
+    human_height = float(getattr(cfg, "human_model_height", 1.78))
+
+    return replace(
+        robot_config,
+        robot_urdf_file=str(human_xml),
+        robot_dof=human_dof,
+        robot_height=human_height,
+        foot_sticking_links=["L_Toe", "R_Toe"],
+    )
+
+
 def _resolve_robot_and_motion_config(
-    cfg: DualRetargetConfig,
+    cfg: object,
 ) -> tuple[RobotConfig, RobotConfig, MotionDataConfig, MotionDataConfig]:
     """Resolve per-agent robot/motion configs from shared settings + optional A/B overrides."""
-    robot_type_a = cfg.robot_a or cfg.robot
-    robot_type_b = cfg.robot_b or cfg.robot
+    robot_type_a, robot_type_b = _resolve_agent_robot_types(cfg)
+    data_format = str(getattr(cfg, "data_format", "smplx"))
+    robot_config_seed = getattr(cfg, "robot_config")
+    motion_data_config_seed = getattr(cfg, "motion_data_config")
 
-    robot_config_a = cfg.robot_config
+    robot_config_a = robot_config_seed
     if robot_config_a.robot_type != robot_type_a:
         robot_config_a = replace(robot_config_a, robot_type=robot_type_a)
+    robot_config_a = _apply_human_model_overrides(robot_config_a, cfg)
 
-    robot_config_b = cfg.robot_config
+    robot_config_b = robot_config_seed
     if robot_config_b.robot_type != robot_type_b:
         robot_config_b = replace(robot_config_b, robot_type=robot_type_b)
+    robot_config_b = _apply_human_model_overrides(robot_config_b, cfg)
 
-    motion_data_config_a = cfg.motion_data_config
-    if motion_data_config_a.robot_type != robot_type_a or motion_data_config_a.data_format != cfg.data_format:
-        motion_data_config_a = replace(motion_data_config_a, robot_type=robot_type_a, data_format=cfg.data_format)
+    motion_data_config_a = motion_data_config_seed
+    if motion_data_config_a.robot_type != robot_type_a or motion_data_config_a.data_format != data_format:
+        motion_data_config_a = replace(motion_data_config_a, robot_type=robot_type_a, data_format=data_format)
 
-    motion_data_config_b = cfg.motion_data_config
-    if motion_data_config_b.robot_type != robot_type_b or motion_data_config_b.data_format != cfg.data_format:
-        motion_data_config_b = replace(motion_data_config_b, robot_type=robot_type_b, data_format=cfg.data_format)
+    motion_data_config_b = motion_data_config_seed
+    if motion_data_config_b.robot_type != robot_type_b or motion_data_config_b.data_format != data_format:
+        motion_data_config_b = replace(motion_data_config_b, robot_type=robot_type_b, data_format=data_format)
 
     return robot_config_a, robot_config_b, motion_data_config_a, motion_data_config_b
 
@@ -615,6 +742,8 @@ def main(cfg: DualRetargetConfig) -> None:
 
     scale_a = task_constants_a.ROBOT_HEIGHT / height_a
     scale_b = task_constants_b.ROBOT_HEIGHT / height_b
+    target_a = "human" if robot_config_a.robot_type == getattr(cfg, "human_model_robot_type", HUMAN_MODEL_ROBOT_TYPE) else "robot"
+    target_b = "human" if robot_config_b.robot_type == getattr(cfg, "human_model_robot_type", HUMAN_MODEL_ROBOT_TYPE) else "robot"
     toe_names_a = motion_data_config_a.toe_names
     toe_names_b = motion_data_config_b.toe_names
 
@@ -749,11 +878,15 @@ def main(cfg: DualRetargetConfig) -> None:
             fps=fps,
             qpos_A=qpos_a[:n],
             qpos_B=qpos_b[:n],
+            human_joints_A=human_a_retarget[:n],
+            human_joints_B=human_b_retarget[:n],
             height_A=height_a,
             height_B=height_b,
             scale_A=scale_a,
             scale_B=scale_b,
             mode="coupled_dual",
+            target_A=target_a,
+            target_B=target_b,
             robot_A=robot_config_a.robot_type,
             robot_B=robot_config_b.robot_type,
             data_format_A=motion_data_config_a.data_format,
@@ -802,10 +935,15 @@ def main(cfg: DualRetargetConfig) -> None:
         fps=fps,
         qpos_A=qpos_a[:n],
         qpos_B=qpos_b[:n],
+        human_joints_A=human_a_retarget[:n],
+        human_joints_B=human_b_retarget[:n],
         height_A=height_a,
         height_B=height_b,
         scale_A=scale_a,
         scale_B=scale_b,
+        mode="independent_dual",
+        target_A=target_a,
+        target_B=target_b,
         robot_A=robot_config_a.robot_type,
         robot_B=robot_config_b.robot_type,
         data_format_A=motion_data_config_a.data_format,

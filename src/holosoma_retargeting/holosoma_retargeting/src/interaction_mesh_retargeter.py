@@ -135,7 +135,14 @@ class InteractionMeshRetargeter:
         # Create complete limits with floating base (-inf, inf) and actuated joint limits
         n_floating_base = 7
         joint_names = [self.robot_model.joint(i).name for i in range(self.robot_model.njnt)]
-        actuated_joints = [(i, name) for i, name in enumerate(joint_names) if name]  # Filter out None names
+        # Only 1-DOF joints contribute scalar limits in qpos order.
+        # Free joints can be named in some models (e.g., SMPL-X MuJoCo) and must
+        # be excluded here to keep bounds aligned with qpos layout.
+        actuated_joints = [
+            (i, name)
+            for i, name in enumerate(joint_names)
+            if name and self.robot_model.jnt_type[i] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)
+        ]
 
         large_number = 1e6
         complete_lower_limits = np.concatenate(

@@ -150,6 +150,9 @@ class Config:
     line_width: float = 2.0
     """Skeleton line width."""
 
+    show_human_joints: bool = True
+    """Render human joint point clouds."""
+
     show_skeleton: bool = True
     """Render skeleton edges in addition to joints."""
 
@@ -704,23 +707,62 @@ def _infer_robot_type(data: np.lib.npyio.NpzFile, key: str) -> str | None:
     return robot_type.split("_")[0]
 
 
-def _resolve_robot_urdf_paths(cfg: Config, qpos_npz_path: Path, has_b: bool) -> tuple[Path, Path | None]:
+def _resolve_target_types(
+    data_npz_path: Path,
+    qpos_npz_path: Path,
+) -> tuple[str, str]:
+    sources: list[np.lib.npyio.NpzFile] = []
+    seen: set[Path] = set()
+    for path in (qpos_npz_path, data_npz_path):
+        resolved = path.resolve()
+        if resolved in seen or not path.exists():
+            continue
+        seen.add(resolved)
+        sources.append(np.load(str(path), allow_pickle=True))
+
+    def _read_target(key: str) -> str | None:
+        for data in sources:
+            if key not in data:
+                continue
+            value = _coerce_scalar_string(data[key])
+            if value is not None:
+                return value.lower()
+        return None
+
+    qpos_a_present = any("qpos_A" in data for data in sources)
+    qpos_b_present = any("qpos_B" in data for data in sources)
+    target_a = _read_target("target_A") or ("robot" if qpos_a_present else "human")
+    target_b = _read_target("target_B") or ("robot" if qpos_b_present else "human")
+    return target_a, target_b
+
+
+def _resolve_robot_urdf_paths(
+    cfg: Config,
+    qpos_npz_path: Path,
+    *,
+    include_a: bool,
+    include_b: bool,
+) -> tuple[Path | None, Path | None]:
     data = np.load(str(qpos_npz_path), allow_pickle=True)
     robot_type_a = _infer_robot_type(data, "robot_A")
     robot_type_b = _infer_robot_type(data, "robot_B")
 
-    urdf_a = cfg.robot_urdf_a or cfg.robot_urdf
-    if urdf_a is None:
-        urdf_a = DEFAULT_URDF_BY_ROBOT.get(robot_type_a or "", DEFAULT_URDF_BY_ROBOT["g1"])
+    urdf_a_path: Path | None = None
+    if include_a:
+        urdf_a = cfg.robot_urdf_a or cfg.robot_urdf
+        if urdf_a is None:
+            urdf_a = DEFAULT_URDF_BY_ROBOT.get(robot_type_a or "", DEFAULT_URDF_BY_ROBOT["g1"])
+        urdf_a_path = Path(urdf_a)
 
     urdf_b_path: Path | None = None
-    if has_b:
+    if include_b:
         urdf_b = cfg.robot_urdf_b or cfg.robot_urdf
         if urdf_b is None:
-            urdf_b = DEFAULT_URDF_BY_ROBOT.get(robot_type_b or "", urdf_a)
+            fallback = str(urdf_a_path) if urdf_a_path is not None else DEFAULT_URDF_BY_ROBOT["g1"]
+            urdf_b = DEFAULT_URDF_BY_ROBOT.get(robot_type_b or "", fallback)
         urdf_b_path = Path(urdf_b)
 
-    return Path(urdf_a), urdf_b_path
+    return urdf_a_path, urdf_b_path
 
 
 def _quat_mul_wxyz(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
@@ -804,20 +846,28 @@ def main(cfg: Config) -> None:
         )
 
     qpos_a, qpos_b, qpos_coordinate_frame = _load_qpos_tracks(qpos_npz_path, cfg.frame_stride)
+    target_a, target_b = _resolve_target_types(npz_path, qpos_npz_path)
+    show_robot_a = bool(cfg.show_robots and target_a != "human")
+    show_robot_b = bool(cfg.show_robots and joints_b is not None and target_b != "human")
+    print(f"[dual_joint_renderer] target_A={target_a} | target_B={target_b}")
     if cfg.show_robots:
-        if qpos_a is None:
+        if show_robot_a and qpos_a is None:
             raise ValueError(
                 f"show_robots=True but no qpos_A found in {qpos_npz_path}. "
-                "Provide --qpos-npz pointing to a dual retarget output."
+                "Provide --qpos-npz pointing to a retarget output with qpos_A."
             )
-        if joints_b is not None and qpos_b is None:
-            raise ValueError(f"show_robots=True with dual joints, but no qpos_B found in {qpos_npz_path}.")
+        if show_robot_b and qpos_b is None:
+            raise ValueError(
+                f"show_robots=True but no qpos_B found in {qpos_npz_path}. "
+                "Provide --qpos-npz pointing to a retarget output with qpos_B."
+            )
         should_convert_qpos = bool(cfg.y_up_to_z_up)
         if qpos_coordinate_frame == "z_up":
             should_convert_qpos = False
         if should_convert_qpos:
-            qpos_a = _convert_y_up_to_z_up_qpos(qpos_a)
-            if qpos_b is not None:
+            if show_robot_a and qpos_a is not None:
+                qpos_a = _convert_y_up_to_z_up_qpos(qpos_a)
+            if show_robot_b and qpos_b is not None:
                 qpos_b = _convert_y_up_to_z_up_qpos(qpos_b)
         print(
             "[dual_joint_renderer] qpos_coordinate_frame="
@@ -835,6 +885,7 @@ def main(cfg: Config) -> None:
         point_size=cfg.point_size,
         point_shape="circle",
     )
+    a_joints_handle.visible = bool(cfg.show_human_joints)
     a_lines_handle = None
     if cfg.show_skeleton and n_joints >= 22:
         a_lines_handle = server.scene.add_line_segments(
@@ -864,6 +915,7 @@ def main(cfg: Config) -> None:
             point_size=cfg.point_size,
             point_shape="circle",
         )
+        b_joints_handle.visible = bool(cfg.show_human_joints)
         if cfg.show_skeleton and n_joints >= 22:
             b_lines_handle = server.scene.add_line_segments(
                 "/humans/B/skeleton",
@@ -902,16 +954,23 @@ def main(cfg: Config) -> None:
     robot_b_root = None
     robot_dof_a = None
     robot_dof_b = None
-    if cfg.show_robots:
-        urdf_a_path, urdf_b_path = _resolve_robot_urdf_paths(cfg, qpos_npz_path, joints_b is not None)
-        robot_urdf_a = yourdfpy.URDF.load(str(urdf_a_path), load_meshes=True, build_scene_graph=True)
+    if show_robot_a or show_robot_b:
+        urdf_a_path, urdf_b_path = _resolve_robot_urdf_paths(
+            cfg,
+            qpos_npz_path,
+            include_a=show_robot_a,
+            include_b=show_robot_b,
+        )
+        if show_robot_a:
+            if urdf_a_path is None:
+                raise ValueError("Could not resolve robot_urdf for A.")
+            robot_urdf_a = yourdfpy.URDF.load(str(urdf_a_path), load_meshes=True, build_scene_graph=True)
+            robot_a_root = server.scene.add_frame("/robots/A", show_axes=False)
+            robot_a = ViserUrdf(server, urdf_or_path=robot_urdf_a, root_node_name="/robots/A")
+            robot_a.show_visual = True
+            robot_dof_a = len(robot_a.get_actuated_joint_limits())
 
-        robot_a_root = server.scene.add_frame("/robots/A", show_axes=False)
-        robot_a = ViserUrdf(server, urdf_or_path=robot_urdf_a, root_node_name="/robots/A")
-        robot_a.show_visual = True
-        robot_dof_a = len(robot_a.get_actuated_joint_limits())
-
-        if joints_b is not None:
+        if show_robot_b:
             if urdf_b_path is None:
                 raise ValueError("Could not resolve robot_urdf for B.")
             robot_urdf_b = yourdfpy.URDF.load(str(urdf_b_path), load_meshes=True, build_scene_graph=True)
@@ -920,14 +979,17 @@ def main(cfg: Config) -> None:
             robot_b.show_visual = True
             robot_dof_b = len(robot_b.get_actuated_joint_limits())
 
-        print(
-            f"[dual_joint_renderer] robot overlay enabled | urdf_A={urdf_a_path} | dof_A={robot_dof_a}"
-            + (f" | urdf_B={urdf_b_path} | dof_B={robot_dof_b}" if joints_b is not None else "")
-        )
+        robot_overlay_parts: list[str] = ["[dual_joint_renderer] robot overlay enabled"]
+        if show_robot_a:
+            robot_overlay_parts.append(f"urdf_A={urdf_a_path} | dof_A={robot_dof_a}")
+        if show_robot_b:
+            robot_overlay_parts.append(f"urdf_B={urdf_b_path} | dof_B={robot_dof_b}")
+        print(" | ".join(robot_overlay_parts))
 
         # Clamp timeline to available qpos frames.
-        n_frames = min(n_frames, qpos_a.shape[0])  # type: ignore[union-attr]
-        if joints_b is not None and qpos_b is not None:
+        if show_robot_a and qpos_a is not None:
+            n_frames = min(n_frames, qpos_a.shape[0])
+        if show_robot_b and qpos_b is not None:
             n_frames = min(n_frames, qpos_b.shape[0])
 
     with server.gui.add_folder("Playback"):
@@ -943,6 +1005,20 @@ def main(cfg: Config) -> None:
             step=0.001,
             initial_value=cfg.point_size,
         )
+        show_human_joints_cb = server.gui.add_checkbox(
+            "Show human joints",
+            initial_value=cfg.show_human_joints,
+        )
+        a_joints_handle.visible = bool(show_human_joints_cb.value)
+        if b_joints_handle is not None:
+            b_joints_handle.visible = bool(show_human_joints_cb.value)
+
+        @show_human_joints_cb.on_update
+        def _(_event) -> None:
+            a_joints_handle.visible = bool(show_human_joints_cb.value)
+            if b_joints_handle is not None:
+                b_joints_handle.visible = bool(show_human_joints_cb.value)
+
         show_skeleton_cb = server.gui.add_checkbox("Show skeleton", initial_value=cfg.show_skeleton)
         if a_lines_handle is not None:
             a_lines_handle.visible = bool(show_skeleton_cb.value)
@@ -985,7 +1061,7 @@ def main(cfg: Config) -> None:
                 if cross_optimizer_handle is not None:
                     cross_optimizer_handle.visible = bool(show_optimizer_graph_cb.value)
 
-        if cfg.show_robots:
+        if show_robot_a or show_robot_b:
             show_robot_meshes_cb = server.gui.add_checkbox("Show robot meshes", initial_value=True)
 
             @show_robot_meshes_cb.on_update
