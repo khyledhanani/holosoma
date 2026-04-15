@@ -6,6 +6,7 @@
 *.onnx
 DATA/
 models/
+SMPLSim
 
 
 # IDE files

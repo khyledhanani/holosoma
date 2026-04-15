@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import mujoco
 import numpy as np
 import smplx  # type: ignore[import-untyped]
 import torch
@@ -148,11 +149,32 @@ class Config:
     mesh_opacity: float = 0.9
     """Mesh opacity in [0, 1]."""
 
+    show_reference_joints: bool = True
+    """Render reference human joints from the input motion NPZ."""
+
+    reference_joint_size: float = 0.018
+    """Point size for reference joint visualization."""
+
     show_human_proxy: bool = False
     """Render the MuJoCo human collision proxy overlay when human joints are available."""
 
+    use_optimized_proxy_mesh: bool = True
+    """Render proxy from optimized MuJoCo geoms/qpos when dual-scene metadata is available."""
+
     human_proxy_opacity: float = 1.0
     """Opacity for the MuJoCo human proxy overlay."""
+
+    show_optimized_body_mesh: bool = False
+    """Overlay mesh-body humanoids driven by the optimized qpos."""
+
+    optimized_body_mesh_xml_a: str | None = None
+    """Single-agent MuJoCo XML for agent A mesh-body overlay."""
+
+    optimized_body_mesh_xml_b: str | None = None
+    """Single-agent MuJoCo XML for agent B mesh-body overlay."""
+
+    optimized_body_mesh_opacity: float = 0.45
+    """Opacity for the optimized body-mesh overlay."""
 
     hide_human_mesh_on_robot_side: bool = True
     """In mixed mode, hide the SMPL-X mesh on the robot-retargeted side."""
@@ -180,6 +202,21 @@ class Config:
 
     qpos_npz: str | None = None
     """Optional npz containing qpos_A/qpos_B. If None, try reading from data_npz."""
+
+
+@dataclass(frozen=True)
+class _DualSceneLayout:
+    q_block_a: np.ndarray
+    q_block_b: np.ndarray
+    min_width_a: int
+    min_width_b: int
+
+
+@dataclass(frozen=True)
+class _AgentProxyMeshCache:
+    geom_ids: tuple[int, ...]
+    local_vertices: tuple[np.ndarray, ...]
+    faces: np.ndarray
 
 
 def _normalize_gender(raw_gender: object) -> str:
@@ -815,6 +852,223 @@ def _update_mesh(
     )
 
 
+def _resolve_dual_scene_metadata(
+    data_npz_path: Path,
+    qpos_npz_path: Path,
+) -> tuple[Path | None, str, str]:
+    sources: list[tuple[Path, np.lib.npyio.NpzFile]] = []
+    seen: set[Path] = set()
+    for path in (qpos_npz_path, data_npz_path):
+        resolved = path.resolve()
+        if resolved in seen or not path.exists():
+            continue
+        seen.add(resolved)
+        sources.append((path, np.load(str(path), allow_pickle=True)))
+
+    dual_scene_raw: str | None = None
+    prefix_a = "A_"
+    prefix_b = "B_"
+    for path, data in sources:
+        if dual_scene_raw is None and "dual_scene_xml" in data:
+            dual_scene_raw = _coerce_scalar_string(data["dual_scene_xml"])
+        if "dual_prefix_A" in data:
+            value = _coerce_scalar_string(data["dual_prefix_A"])
+            if value:
+                prefix_a = value
+        if "dual_prefix_B" in data:
+            value = _coerce_scalar_string(data["dual_prefix_B"])
+            if value:
+                prefix_b = value
+
+    if not dual_scene_raw:
+        return None, prefix_a, prefix_b
+
+    candidate = Path(dual_scene_raw)
+    probes: list[Path] = []
+    if candidate.is_absolute():
+        probes.append(candidate)
+    else:
+        probes.append(candidate)
+        for path, _ in sources:
+            probes.append(path.parent / candidate)
+        probes.append(Path.cwd() / candidate)
+    for probe in probes:
+        if probe.exists():
+            return probe, prefix_a, prefix_b
+    return None, prefix_a, prefix_b
+
+
+def _resolve_dual_scene_layout(
+    model: mujoco.MjModel,
+    prefix_a: str,
+    prefix_b: str,
+) -> _DualSceneLayout:
+    free_joint_ids = [j for j in range(model.njnt) if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE]
+    if len(free_joint_ids) < 2:
+        raise ValueError("Expected at least two free joints in dual scene.")
+
+    free_joint_ids_sorted = sorted(free_joint_ids, key=lambda j: int(model.jnt_qposadr[j]))
+    joint_id_a: int | None = None
+    joint_id_b: int | None = None
+    for joint_id in free_joint_ids_sorted:
+        body_id = int(model.jnt_bodyid[joint_id])
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        if joint_id_a is None and body_name.startswith(prefix_a):
+            joint_id_a = int(joint_id)
+        if joint_id_b is None and body_name.startswith(prefix_b):
+            joint_id_b = int(joint_id)
+    if joint_id_a is None or joint_id_b is None:
+        joint_id_a = int(free_joint_ids_sorted[0])
+        joint_id_b = int(free_joint_ids_sorted[1])
+
+    qadr_a = int(model.jnt_qposadr[joint_id_a])
+    qadr_b = int(model.jnt_qposadr[joint_id_b])
+    qadr_all_free = sorted(int(model.jnt_qposadr[j]) for j in free_joint_ids)
+
+    def _next_qadr(qadr: int) -> int:
+        return next((q for q in qadr_all_free if q > qadr), int(model.nq))
+
+    qend_a = _next_qadr(qadr_a)
+    qend_b = _next_qadr(qadr_b)
+    if qend_a <= qadr_a or qend_b <= qadr_b:
+        raise ValueError("Invalid free-joint qpos layout in dual scene model.")
+
+    q_block_a = np.arange(qadr_a, qend_a, dtype=int)
+    q_block_b = np.arange(qadr_b, qend_b, dtype=int)
+    return _DualSceneLayout(
+        q_block_a=q_block_a,
+        q_block_b=q_block_b,
+        min_width_a=int(len(q_block_a)),
+        min_width_b=int(len(q_block_b)),
+    )
+
+
+def _compose_full_qpos(
+    model: mujoco.MjModel,
+    layout: _DualSceneLayout,
+    qpos_a_local: np.ndarray | None,
+    qpos_b_local: np.ndarray | None,
+) -> np.ndarray:
+    q_full = np.array(model.qpos0, dtype=np.float32, copy=True)
+    if qpos_a_local is not None:
+        if qpos_a_local.shape[0] < layout.min_width_a:
+            raise ValueError(
+                f"qpos_A frame has width {qpos_a_local.shape[0]}, expected at least {layout.min_width_a}."
+            )
+        q_full[layout.q_block_a[: layout.min_width_a]] = qpos_a_local[: layout.min_width_a]
+    if qpos_b_local is not None:
+        if qpos_b_local.shape[0] < layout.min_width_b:
+            raise ValueError(
+                f"qpos_B frame has width {qpos_b_local.shape[0]}, expected at least {layout.min_width_b}."
+            )
+        q_full[layout.q_block_b[: layout.min_width_b]] = qpos_b_local[: layout.min_width_b]
+    return q_full
+
+
+def _geom_belongs_to_prefix(model: mujoco.MjModel, geom_id: int, prefix: str) -> bool:
+    geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
+    if geom_name.startswith(prefix):
+        return True
+    body_id = int(model.geom_bodyid[geom_id])
+    body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+    return body_name.startswith(prefix)
+
+
+def _is_floor_like_geom(model: mujoco.MjModel, geom_id: int) -> bool:
+    if int(model.geom_type[geom_id]) == mujoco.mjtGeom.mjGEOM_PLANE:
+        return True
+    geom_name = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "").lower()
+    body_id = int(model.geom_bodyid[geom_id])
+    body_name = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or "").lower()
+    return "ground" in geom_name or "floor" in geom_name or "ground" in body_name or "floor" in body_name
+
+
+def _mesh_local_vf_from_geom(model: mujoco.MjModel, geom_id: int) -> tuple[np.ndarray, np.ndarray] | None:
+    geom_type = int(model.geom_type[geom_id])
+    size = np.asarray(model.geom_size[geom_id], dtype=np.float64)
+    mesh: trimesh.Trimesh | None = None
+
+    if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+        mesh_id = int(model.geom_dataid[geom_id])
+        if mesh_id < 0:
+            return None
+        v0, nv = int(model.mesh_vertadr[mesh_id]), int(model.mesh_vertnum[mesh_id])
+        f0, nf = int(model.mesh_faceadr[mesh_id]), int(model.mesh_facenum[mesh_id])
+        vertices = np.asarray(model.mesh_vert[v0 : v0 + nv], dtype=np.float32)
+        faces = np.asarray(model.mesh_face[f0 : f0 + nf], dtype=np.uint32)
+        return vertices, faces
+
+    if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+        mesh = trimesh.creation.icosphere(subdivisions=2, radius=float(size[0]))
+    elif geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+        mesh = trimesh.creation.capsule(radius=float(size[0]), height=max(1e-4, float(2.0 * size[1])), count=[8, 14])
+    elif geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
+        mesh = trimesh.creation.cylinder(radius=float(size[0]), height=max(1e-4, float(2.0 * size[1])), sections=18)
+    elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+        mesh = trimesh.creation.box(extents=2.0 * np.asarray(size[:3], dtype=np.float64))
+    elif geom_type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
+        sphere = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
+        vertices = np.asarray(sphere.vertices, dtype=np.float32) * np.asarray(size[:3], dtype=np.float32)[None, :]
+        faces = np.asarray(sphere.faces, dtype=np.uint32)
+        return vertices, faces
+    else:
+        return None
+
+    return np.asarray(mesh.vertices, dtype=np.float32), np.asarray(mesh.faces, dtype=np.uint32)
+
+
+def _build_agent_proxy_mesh_cache(model: mujoco.MjModel, prefix: str) -> _AgentProxyMeshCache | None:
+    geom_ids: list[int] = []
+    local_vertices: list[np.ndarray] = []
+    faces_parts: list[np.ndarray] = []
+    face_offset = 0
+    for geom_id in range(model.ngeom):
+        if _is_floor_like_geom(model, geom_id):
+            continue
+        if not _geom_belongs_to_prefix(model, geom_id, prefix):
+            continue
+        local = _mesh_local_vf_from_geom(model, geom_id)
+        if local is None:
+            continue
+        verts_local, faces_local = local
+        geom_ids.append(int(geom_id))
+        local_vertices.append(verts_local)
+        faces_parts.append(faces_local + face_offset)
+        face_offset += verts_local.shape[0]
+
+    if not geom_ids:
+        return None
+    return _AgentProxyMeshCache(
+        geom_ids=tuple(geom_ids),
+        local_vertices=tuple(local_vertices),
+        faces=np.vstack(faces_parts).astype(np.uint32, copy=False),
+    )
+
+
+def _extract_agent_proxy_world_mesh(
+    data: mujoco.MjData,
+    cache: _AgentProxyMeshCache,
+) -> tuple[np.ndarray, np.ndarray]:
+    verts_world_parts: list[np.ndarray] = []
+    for idx, geom_id in enumerate(cache.geom_ids):
+        R = np.asarray(data.geom_xmat[geom_id], dtype=np.float32).reshape(3, 3)
+        t = np.asarray(data.geom_xpos[geom_id], dtype=np.float32)
+        verts_local = cache.local_vertices[idx]
+        verts_world_parts.append(verts_local @ R.T + t[None, :])
+    if not verts_world_parts:
+        return np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32)
+    return np.vstack(verts_world_parts).astype(np.float32, copy=False), cache.faces
+
+
+def _compose_single_model_qpos(model: mujoco.MjModel, qpos_local: np.ndarray | None) -> np.ndarray:
+    q_full = np.array(model.qpos0, dtype=np.float32, copy=True)
+    if qpos_local is None:
+        return q_full
+    width = min(int(model.nq), int(qpos_local.shape[0]))
+    q_full[:width] = np.asarray(qpos_local[:width], dtype=np.float32)
+    return q_full
+
+
 def main(cfg: Config) -> None:
     npz_path = Path(cfg.data_npz)
     if not npz_path.exists():
@@ -886,21 +1140,45 @@ def main(cfg: Config) -> None:
 
     qpos_npz_path = Path(cfg.qpos_npz) if cfg.qpos_npz is not None else npz_path
     qpos_a, qpos_b, qpos_coordinate_frame = _load_qpos_tracks(qpos_npz_path, cfg.frame_stride)
+    target_a, target_b = _resolve_target_types(npz_path, qpos_npz_path)
+    show_robot_a = bool(cfg.show_robots and target_a != "human")
+    show_robot_b = bool(cfg.show_robots and target_b != "human")
+    want_proxy_a = bool(cfg.show_human_proxy and target_a == "human")
+    want_proxy_b = bool(cfg.show_human_proxy and target_b == "human")
+
+    if cfg.show_robots:
+        if show_robot_a and qpos_a is None:
+            raise ValueError(
+                f"show_robots=True but qpos_A was not found in {qpos_npz_path}. "
+                "Provide --qpos-npz pointing to a retarget output with qpos_A."
+            )
+        if show_robot_b and qpos_b is None:
+            raise ValueError(
+                f"show_robots=True but qpos_B was not found in {qpos_npz_path}. "
+                "Provide --qpos-npz pointing to a retarget output with qpos_B."
+            )
+
+    should_convert_qpos = bool(cfg.y_up_to_z_up)
+    if qpos_coordinate_frame == "z_up":
+        should_convert_qpos = False
+    if should_convert_qpos:
+        if qpos_a is not None:
+            qpos_a = _convert_y_up_to_z_up_qpos(qpos_a)
+        if qpos_b is not None:
+            qpos_b = _convert_y_up_to_z_up_qpos(qpos_b)
+    if cfg.show_robots or (cfg.show_human_proxy and cfg.use_optimized_proxy_mesh):
+        print(
+            "[dual_interx_mesh_renderer] qpos_coordinate_frame="
+            f"{qpos_coordinate_frame or 'legacy_assumed_y_up'} | qpos_y_up_to_z_up_applied={should_convert_qpos}"
+        )
+
     proxy_vertical_axis = _infer_proxy_vertical_axis(proxy_joints_a, proxy_joints_b)
     proxy_frame_effective = proxy_coordinate_frame
     if proxy_frame_effective is None and qpos_coordinate_frame in {"y_up", "z_up"}:
         proxy_frame_effective = qpos_coordinate_frame
     if proxy_frame_effective is None:
         proxy_frame_effective = "z_up" if proxy_vertical_axis == 2 else "y_up"
-    target_a, target_b = _resolve_target_types(npz_path, qpos_npz_path)
-    show_robot_a = bool(cfg.show_robots and target_a != "human")
-    show_robot_b = bool(cfg.show_robots and target_b != "human")
-    show_proxy_a = bool(cfg.show_human_proxy and proxy_joints_a is not None and target_a == "human")
-    show_proxy_b = bool(cfg.show_human_proxy and proxy_joints_b is not None and target_b == "human")
-    hide_human_mesh_a = bool(cfg.hide_human_mesh_on_robot_side and target_a == "robot" and target_b == "human")
-    hide_human_mesh_b = bool(cfg.hide_human_mesh_on_robot_side and target_b == "robot" and target_a == "human")
-    print(f"[dual_interx_mesh_renderer] target_A={target_a} | target_B={target_b}")
-    if cfg.show_human_proxy:
+    if cfg.show_human_proxy or cfg.show_reference_joints:
         should_convert_proxy = bool(cfg.y_up_to_z_up)
         if proxy_frame_effective == "z_up":
             should_convert_proxy = False
@@ -909,11 +1187,106 @@ def main(cfg: Config) -> None:
                 proxy_joints_a = _convert_y_up_to_z_up_points(proxy_joints_a)
             if proxy_joints_b is not None:
                 proxy_joints_b = _convert_y_up_to_z_up_points(proxy_joints_b)
+    hide_human_mesh_a = bool(cfg.hide_human_mesh_on_robot_side and target_a == "robot" and target_b == "human")
+    hide_human_mesh_b = bool(cfg.hide_human_mesh_on_robot_side and target_b == "robot" and target_a == "human")
+    print(f"[dual_interx_mesh_renderer] target_A={target_a} | target_B={target_b}")
+
+    dual_proxy_model: mujoco.MjModel | None = None
+    dual_proxy_data: mujoco.MjData | None = None
+    dual_proxy_layout: _DualSceneLayout | None = None
+    optimized_cache_a: _AgentProxyMeshCache | None = None
+    optimized_cache_b: _AgentProxyMeshCache | None = None
+    use_optimized_proxy_a = False
+    use_optimized_proxy_b = False
+    if cfg.use_optimized_proxy_mesh and (want_proxy_a or want_proxy_b):
+        dual_scene_xml, dual_prefix_a, dual_prefix_b = _resolve_dual_scene_metadata(npz_path, qpos_npz_path)
+        if dual_scene_xml is None:
+            print("[dual_interx_mesh_renderer] optimized_proxy unavailable: dual_scene_xml metadata missing.")
+        else:
+            try:
+                dual_proxy_model = mujoco.MjModel.from_xml_path(str(dual_scene_xml))
+                dual_proxy_data = mujoco.MjData(dual_proxy_model)
+                dual_proxy_layout = _resolve_dual_scene_layout(dual_proxy_model, prefix_a=dual_prefix_a, prefix_b=dual_prefix_b)
+                if want_proxy_a:
+                    optimized_cache_a = _build_agent_proxy_mesh_cache(dual_proxy_model, dual_prefix_a)
+                    use_optimized_proxy_a = optimized_cache_a is not None and qpos_a is not None
+                if want_proxy_b:
+                    optimized_cache_b = _build_agent_proxy_mesh_cache(dual_proxy_model, dual_prefix_b)
+                    use_optimized_proxy_b = optimized_cache_b is not None and qpos_b is not None
+                if want_proxy_a and optimized_cache_a is None:
+                    print("[dual_interx_mesh_renderer] optimized_proxy A unavailable: no prefixed geoms found in dual scene.")
+                if want_proxy_b and optimized_cache_b is None:
+                    print("[dual_interx_mesh_renderer] optimized_proxy B unavailable: no prefixed geoms found in dual scene.")
+                if want_proxy_a and qpos_a is None:
+                    print("[dual_interx_mesh_renderer] optimized_proxy A unavailable: qpos_A missing.")
+                if want_proxy_b and qpos_b is None:
+                    print("[dual_interx_mesh_renderer] optimized_proxy B unavailable: qpos_B missing.")
+                if use_optimized_proxy_a or use_optimized_proxy_b:
+                    print(
+                        "[dual_interx_mesh_renderer] optimized_proxy enabled"
+                        f" | dual_scene_xml={dual_scene_xml}"
+                        f" | prefix_A={dual_prefix_a}"
+                        f" | prefix_B={dual_prefix_b}"
+                    )
+            except Exception as exc:
+                dual_proxy_model = None
+                dual_proxy_data = None
+                dual_proxy_layout = None
+                optimized_cache_a = None
+                optimized_cache_b = None
+                print(f"[dual_interx_mesh_renderer] optimized_proxy initialization failed: {exc}")
+
+    body_mesh_model_a: mujoco.MjModel | None = None
+    body_mesh_data_a: mujoco.MjData | None = None
+    body_mesh_cache_a: _AgentProxyMeshCache | None = None
+    body_mesh_model_b: mujoco.MjModel | None = None
+    body_mesh_data_b: mujoco.MjData | None = None
+    body_mesh_cache_b: _AgentProxyMeshCache | None = None
+    use_body_mesh_a = False
+    use_body_mesh_b = False
+    if cfg.show_optimized_body_mesh:
+        if cfg.optimized_body_mesh_xml_a is not None and qpos_a is not None:
+            try:
+                body_mesh_model_a = mujoco.MjModel.from_xml_path(str(Path(cfg.optimized_body_mesh_xml_a)))
+                body_mesh_data_a = mujoco.MjData(body_mesh_model_a)
+                body_mesh_cache_a = _build_agent_proxy_mesh_cache(body_mesh_model_a, "")
+                use_body_mesh_a = body_mesh_cache_a is not None
+            except Exception as exc:
+                print(f"[dual_interx_mesh_renderer] optimized_body_mesh A initialization failed: {exc}")
+                body_mesh_model_a = None
+                body_mesh_data_a = None
+                body_mesh_cache_a = None
+        if cfg.optimized_body_mesh_xml_b is not None and qpos_b is not None:
+            try:
+                body_mesh_model_b = mujoco.MjModel.from_xml_path(str(Path(cfg.optimized_body_mesh_xml_b)))
+                body_mesh_data_b = mujoco.MjData(body_mesh_model_b)
+                body_mesh_cache_b = _build_agent_proxy_mesh_cache(body_mesh_model_b, "")
+                use_body_mesh_b = body_mesh_cache_b is not None
+            except Exception as exc:
+                print(f"[dual_interx_mesh_renderer] optimized_body_mesh B initialization failed: {exc}")
+                body_mesh_model_b = None
+                body_mesh_data_b = None
+                body_mesh_cache_b = None
+        if use_body_mesh_a or use_body_mesh_b:
+            print(
+                "[dual_interx_mesh_renderer] optimized_body_mesh enabled"
+                f" | xml_A={cfg.optimized_body_mesh_xml_a or '<none>'}"
+                f" | xml_B={cfg.optimized_body_mesh_xml_b or '<none>'}"
+            )
+
+    show_proxy_a = bool(want_proxy_a and (use_optimized_proxy_a or proxy_joints_a is not None))
+    show_proxy_b = bool(want_proxy_b and (use_optimized_proxy_b or proxy_joints_b is not None))
+    show_ref_a = bool(cfg.show_reference_joints and proxy_joints_a is not None)
+    show_ref_b = bool(cfg.show_reference_joints and proxy_joints_b is not None)
+    if cfg.show_human_proxy:
+        proxy_mode_a = "optimized" if use_optimized_proxy_a else ("synthetic" if show_proxy_a else "off")
+        proxy_mode_b = "optimized" if use_optimized_proxy_b else ("synthetic" if show_proxy_b else "off")
         print(
             "[dual_interx_mesh_renderer] human_proxy="
             f"{'enabled' if (show_proxy_a or show_proxy_b) else 'unavailable'}"
             f" | proxy_coordinate_frame={proxy_frame_effective}"
-            f" | proxy_y_up_to_z_up_applied={should_convert_proxy}"
+            f" | proxy_mode_A={proxy_mode_a}"
+            f" | proxy_mode_B={proxy_mode_b}"
         )
     if cfg.align_mesh_to_proxy and mesh_available:
         vertical_axis = 2 if proxy_frame_effective == "z_up" else 1
@@ -946,29 +1319,33 @@ def main(cfg: Config) -> None:
                 "[dual_interx_mesh_renderer] align_B=feet_anchored"
                 f" mean_offset={float(np.linalg.norm(np.mean(delta_b, axis=0))):.5f}"
             )
-    if cfg.show_robots:
-        if show_robot_a and qpos_a is None:
-            raise ValueError(
-                f"show_robots=True but qpos_A was not found in {qpos_npz_path}. "
-                "Provide --qpos-npz pointing to a retarget output with qpos_A."
-            )
-        if show_robot_b and qpos_b is None:
-            raise ValueError(
-                f"show_robots=True but qpos_B was not found in {qpos_npz_path}. "
-                "Provide --qpos-npz pointing to a retarget output with qpos_B."
-            )
-        should_convert_qpos = bool(cfg.y_up_to_z_up)
-        if qpos_coordinate_frame == "z_up":
-            should_convert_qpos = False
-        if should_convert_qpos:
-            if show_robot_a and qpos_a is not None:
-                qpos_a = _convert_y_up_to_z_up_qpos(qpos_a)
-            if show_robot_b and qpos_b is not None:
-                qpos_b = _convert_y_up_to_z_up_qpos(qpos_b)
-        print(
-            "[dual_interx_mesh_renderer] qpos_coordinate_frame="
-            f"{qpos_coordinate_frame or 'legacy_assumed_y_up'} | qpos_y_up_to_z_up_applied={should_convert_qpos}"
-        )
+    if show_proxy_a and use_optimized_proxy_a and qpos_a is not None:
+        n_frames = min(n_frames, qpos_a.shape[0])
+    if show_proxy_b and use_optimized_proxy_b and qpos_b is not None:
+        n_frames = min(n_frames, qpos_b.shape[0])
+    if show_proxy_a and (not use_optimized_proxy_a) and proxy_joints_a is not None:
+        n_frames = min(n_frames, proxy_joints_a.shape[0])
+    if show_proxy_b and (not use_optimized_proxy_b) and proxy_joints_b is not None:
+        n_frames = min(n_frames, proxy_joints_b.shape[0])
+    if show_ref_a and proxy_joints_a is not None:
+        n_frames = min(n_frames, proxy_joints_a.shape[0])
+    if show_ref_b and proxy_joints_b is not None:
+        n_frames = min(n_frames, proxy_joints_b.shape[0])
+    if show_robot_a and qpos_a is not None:
+        n_frames = min(n_frames, qpos_a.shape[0])
+    if show_robot_b and qpos_b is not None:
+        n_frames = min(n_frames, qpos_b.shape[0])
+
+    verts_a = verts_a[:n_frames]
+    verts_b = verts_b[:n_frames]
+    if proxy_joints_a is not None:
+        proxy_joints_a = proxy_joints_a[:n_frames]
+    if proxy_joints_b is not None:
+        proxy_joints_b = proxy_joints_b[:n_frames]
+    if qpos_a is not None:
+        qpos_a = qpos_a[:n_frames]
+    if qpos_b is not None:
+        qpos_b = qpos_b[:n_frames]
 
     server = viser.ViserServer(port=cfg.port)
     server.scene.add_grid("/grid", width=4.0, height=4.0, position=(0.0, 0.0, 0.0))
@@ -992,10 +1369,64 @@ def main(cfg: Config) -> None:
             opacity=float(cfg.mesh_opacity),
         )
         mesh_b.visible = not hide_human_mesh_b
+
+    ref_a_handle = None
+    ref_b_handle = None
+    if show_ref_a and proxy_joints_a is not None:
+        ref_a_handle = server.scene.add_point_cloud(
+            "/humans/A/reference_joints",
+            points=proxy_joints_a[0],
+            colors=np.tile(np.array([[0, 220, 255]], dtype=np.uint8), (proxy_joints_a.shape[1], 1)),
+            point_size=float(cfg.reference_joint_size),
+            point_shape="circle",
+        )
+    if show_ref_b and proxy_joints_b is not None:
+        ref_b_handle = server.scene.add_point_cloud(
+            "/humans/B/reference_joints",
+            points=proxy_joints_b[0],
+            colors=np.tile(np.array([[255, 190, 0]], dtype=np.uint8), (proxy_joints_b.shape[1], 1)),
+            point_size=float(cfg.reference_joint_size),
+            point_shape="circle",
+        )
+
+    def _optimized_proxy_meshes_for_frame(
+        frame_idx: int,
+    ) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+        if (
+            dual_proxy_model is None
+            or dual_proxy_data is None
+            or dual_proxy_layout is None
+            or (optimized_cache_a is None and optimized_cache_b is None)
+        ):
+            empty = (np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32))
+            return empty, empty
+        qa = qpos_a[frame_idx] if qpos_a is not None else None
+        qb = qpos_b[frame_idx] if qpos_b is not None else None
+        q_full = _compose_full_qpos(dual_proxy_model, dual_proxy_layout, qa, qb)
+        dual_proxy_data.qpos[:] = q_full
+        mujoco.mj_forward(dual_proxy_model, dual_proxy_data)
+        mesh_a_frame = (
+            _extract_agent_proxy_world_mesh(dual_proxy_data, optimized_cache_a)
+            if optimized_cache_a is not None
+            else (np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32))
+        )
+        mesh_b_frame = (
+            _extract_agent_proxy_world_mesh(dual_proxy_data, optimized_cache_b)
+            if optimized_cache_b is not None
+            else (np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32))
+        )
+        return mesh_a_frame, mesh_b_frame
+
     proxy_a_handle = None
     proxy_b_handle = None
-    if show_proxy_a and proxy_joints_a is not None:
-        proxy_a_verts, proxy_a_faces = _build_proxy_mesh_frame(proxy_joints_a[0], joint_names=proxy_names_a)
+    proxy0_a, proxy0_b = _optimized_proxy_meshes_for_frame(0)
+    if show_proxy_a:
+        if use_optimized_proxy_a:
+            proxy_a_verts, proxy_a_faces = proxy0_a
+        elif proxy_joints_a is not None:
+            proxy_a_verts, proxy_a_faces = _build_proxy_mesh_frame(proxy_joints_a[0], joint_names=proxy_names_a)
+        else:
+            proxy_a_verts, proxy_a_faces = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32)
         proxy_a_handle = server.scene.add_mesh_simple(
             "/humans/A/proxy",
             vertices=proxy_a_verts,
@@ -1003,14 +1434,57 @@ def main(cfg: Config) -> None:
             color=(215, 85, 70),
             opacity=float(cfg.human_proxy_opacity),
         )
-    if show_proxy_b and proxy_joints_b is not None:
-        proxy_b_verts, proxy_b_faces = _build_proxy_mesh_frame(proxy_joints_b[0], joint_names=proxy_names_b)
+    if show_proxy_b:
+        if use_optimized_proxy_b:
+            proxy_b_verts, proxy_b_faces = proxy0_b
+        elif proxy_joints_b is not None:
+            proxy_b_verts, proxy_b_faces = _build_proxy_mesh_frame(proxy_joints_b[0], joint_names=proxy_names_b)
+        else:
+            proxy_b_verts, proxy_b_faces = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32)
         proxy_b_handle = server.scene.add_mesh_simple(
             "/humans/B/proxy",
             vertices=proxy_b_verts,
             faces=proxy_b_faces,
             color=(215, 85, 70),
             opacity=float(cfg.human_proxy_opacity),
+        )
+
+    def _optimized_body_meshes_for_frame(
+        frame_idx: int,
+    ) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+        empty = (np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32))
+        mesh_a_frame = empty
+        mesh_b_frame = empty
+        if use_body_mesh_a and body_mesh_model_a is not None and body_mesh_data_a is not None and body_mesh_cache_a is not None and qpos_a is not None:
+            qa = _compose_single_model_qpos(body_mesh_model_a, qpos_a[frame_idx])
+            body_mesh_data_a.qpos[:] = qa
+            mujoco.mj_forward(body_mesh_model_a, body_mesh_data_a)
+            mesh_a_frame = _extract_agent_proxy_world_mesh(body_mesh_data_a, body_mesh_cache_a)
+        if use_body_mesh_b and body_mesh_model_b is not None and body_mesh_data_b is not None and body_mesh_cache_b is not None and qpos_b is not None:
+            qb = _compose_single_model_qpos(body_mesh_model_b, qpos_b[frame_idx])
+            body_mesh_data_b.qpos[:] = qb
+            mujoco.mj_forward(body_mesh_model_b, body_mesh_data_b)
+            mesh_b_frame = _extract_agent_proxy_world_mesh(body_mesh_data_b, body_mesh_cache_b)
+        return mesh_a_frame, mesh_b_frame
+
+    body_mesh_handle_a = None
+    body_mesh_handle_b = None
+    body_mesh0_a, body_mesh0_b = _optimized_body_meshes_for_frame(0)
+    if use_body_mesh_a:
+        body_mesh_handle_a = server.scene.add_mesh_simple(
+            "/humans/A/optimized_body_mesh",
+            vertices=body_mesh0_a[0],
+            faces=body_mesh0_a[1],
+            color=(40, 255, 120),
+            opacity=float(cfg.optimized_body_mesh_opacity),
+        )
+    if use_body_mesh_b:
+        body_mesh_handle_b = server.scene.add_mesh_simple(
+            "/humans/B/optimized_body_mesh",
+            vertices=body_mesh0_b[0],
+            faces=body_mesh0_b[1],
+            color=(255, 60, 180),
+            opacity=float(cfg.optimized_body_mesh_opacity),
         )
 
     robot_a = None
@@ -1051,13 +1525,6 @@ def main(cfg: Config) -> None:
             robot_overlay_parts.append(f"urdf_B={urdf_b_path} | dof_B={robot_dof_b}")
         print(" | ".join(robot_overlay_parts))
 
-        if show_robot_a and qpos_a is not None:
-            n_frames = min(n_frames, qpos_a.shape[0])
-        if show_robot_b and qpos_b is not None:
-            n_frames = min(n_frames, qpos_b.shape[0])
-        verts_a = verts_a[:n_frames]
-        verts_b = verts_b[:n_frames]
-
     with server.gui.add_folder("Playback"):
         playing_cb = server.gui.add_checkbox("Playing", initial_value=True)
         frame_slider = server.gui.add_slider("Frame", min=0, max=max(0, n_frames - 1), step=1, initial_value=0)
@@ -1072,6 +1539,17 @@ def main(cfg: Config) -> None:
             initial_value=float(cfg.mesh_opacity),
         )
         show_human_meshes_cb = server.gui.add_checkbox("Show human meshes", initial_value=True)
+        show_reference_joints_cb = None
+        reference_joint_size_slider = None
+        if show_ref_a or show_ref_b:
+            show_reference_joints_cb = server.gui.add_checkbox("Show reference joints", initial_value=True)
+            reference_joint_size_slider = server.gui.add_slider(
+                "Reference joint size",
+                min=0.005,
+                max=0.06,
+                step=0.001,
+                initial_value=float(cfg.reference_joint_size),
+            )
         if show_proxy_a or show_proxy_b:
             proxy_opacity_slider = server.gui.add_slider(
                 "Proxy opacity",
@@ -1081,6 +1559,17 @@ def main(cfg: Config) -> None:
                 initial_value=float(cfg.human_proxy_opacity),
             )
             show_proxy_meshes_cb = server.gui.add_checkbox("Show proxy meshes", initial_value=True)
+        show_body_mesh_cb = None
+        body_mesh_opacity_slider = None
+        if use_body_mesh_a or use_body_mesh_b:
+            body_mesh_opacity_slider = server.gui.add_slider(
+                "Optimized body mesh opacity",
+                min=0.05,
+                max=1.0,
+                step=0.01,
+                initial_value=float(cfg.optimized_body_mesh_opacity),
+            )
+            show_body_mesh_cb = server.gui.add_checkbox("Show optimized body meshes", initial_value=True)
         if show_robot_a or show_robot_b:
             show_robot_meshes_cb = server.gui.add_checkbox("Show robot meshes", initial_value=True)
 
@@ -1092,7 +1581,7 @@ def main(cfg: Config) -> None:
                     robot_b.show_visual = bool(show_robot_meshes_cb.value)
 
     def _apply_frame(idx: int) -> None:
-        nonlocal mesh_a, mesh_b, proxy_a_handle, proxy_b_handle
+        nonlocal mesh_a, mesh_b, proxy_a_handle, proxy_b_handle, ref_a_handle, ref_b_handle, body_mesh_handle_a, body_mesh_handle_b
         i = int(np.clip(idx, 0, n_frames - 1))
         opacity = float(opacity_slider.value)
         if mesh_available and mesh_a is not None:
@@ -1119,8 +1608,27 @@ def main(cfg: Config) -> None:
             )
             if hasattr(mesh_b, "visible"):
                 mesh_b.visible = bool(show_human_meshes_cb.value) and (not hide_human_mesh_b)
-        if show_proxy_a and proxy_joints_a is not None:
-            proxy_a_verts, proxy_a_faces = _build_proxy_mesh_frame(proxy_joints_a[i], joint_names=proxy_names_a)
+        if show_ref_a and proxy_joints_a is not None and ref_a_handle is not None:
+            ref_a_handle.points = proxy_joints_a[i]
+            ref_a_handle.point_size = float(reference_joint_size_slider.value) if reference_joint_size_slider is not None else float(cfg.reference_joint_size)
+            if hasattr(ref_a_handle, "visible"):
+                ref_a_handle.visible = bool(show_reference_joints_cb.value) if show_reference_joints_cb is not None else True
+        if show_ref_b and proxy_joints_b is not None and ref_b_handle is not None:
+            ref_b_handle.points = proxy_joints_b[i]
+            ref_b_handle.point_size = float(reference_joint_size_slider.value) if reference_joint_size_slider is not None else float(cfg.reference_joint_size)
+            if hasattr(ref_b_handle, "visible"):
+                ref_b_handle.visible = bool(show_reference_joints_cb.value) if show_reference_joints_cb is not None else True
+        proxy_frame_a = (np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32))
+        proxy_frame_b = (np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32))
+        if (show_proxy_a and use_optimized_proxy_a) or (show_proxy_b and use_optimized_proxy_b):
+            proxy_frame_a, proxy_frame_b = _optimized_proxy_meshes_for_frame(i)
+        if show_proxy_a:
+            if use_optimized_proxy_a:
+                proxy_a_verts, proxy_a_faces = proxy_frame_a
+            elif proxy_joints_a is not None:
+                proxy_a_verts, proxy_a_faces = _build_proxy_mesh_frame(proxy_joints_a[i], joint_names=proxy_names_a)
+            else:
+                proxy_a_verts, proxy_a_faces = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32)
             proxy_a_handle = _update_mesh(
                 server=server,
                 handle=proxy_a_handle,
@@ -1132,8 +1640,13 @@ def main(cfg: Config) -> None:
             )
             if hasattr(proxy_a_handle, "visible"):
                 proxy_a_handle.visible = bool(show_proxy_meshes_cb.value)
-        if show_proxy_b and proxy_joints_b is not None:
-            proxy_b_verts, proxy_b_faces = _build_proxy_mesh_frame(proxy_joints_b[i], joint_names=proxy_names_b)
+        if show_proxy_b:
+            if use_optimized_proxy_b:
+                proxy_b_verts, proxy_b_faces = proxy_frame_b
+            elif proxy_joints_b is not None:
+                proxy_b_verts, proxy_b_faces = _build_proxy_mesh_frame(proxy_joints_b[i], joint_names=proxy_names_b)
+            else:
+                proxy_b_verts, proxy_b_faces = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint32)
             proxy_b_handle = _update_mesh(
                 server=server,
                 handle=proxy_b_handle,
@@ -1145,6 +1658,33 @@ def main(cfg: Config) -> None:
             )
             if hasattr(proxy_b_handle, "visible"):
                 proxy_b_handle.visible = bool(show_proxy_meshes_cb.value)
+
+        if use_body_mesh_a or use_body_mesh_b:
+            body_frame_a, body_frame_b = _optimized_body_meshes_for_frame(i)
+            if use_body_mesh_a:
+                body_mesh_handle_a = _update_mesh(
+                    server=server,
+                    handle=body_mesh_handle_a,
+                    path="/humans/A/optimized_body_mesh",
+                    vertices=body_frame_a[0],
+                    faces=body_frame_a[1],
+                    color=(40, 255, 120),
+                    opacity=float(body_mesh_opacity_slider.value) if body_mesh_opacity_slider is not None else float(cfg.optimized_body_mesh_opacity),
+                )
+                if hasattr(body_mesh_handle_a, "visible"):
+                    body_mesh_handle_a.visible = bool(show_body_mesh_cb.value) if show_body_mesh_cb is not None else True
+            if use_body_mesh_b:
+                body_mesh_handle_b = _update_mesh(
+                    server=server,
+                    handle=body_mesh_handle_b,
+                    path="/humans/B/optimized_body_mesh",
+                    vertices=body_frame_b[0],
+                    faces=body_frame_b[1],
+                    color=(255, 60, 180),
+                    opacity=float(body_mesh_opacity_slider.value) if body_mesh_opacity_slider is not None else float(cfg.optimized_body_mesh_opacity),
+                )
+                if hasattr(body_mesh_handle_b, "visible"):
+                    body_mesh_handle_b.visible = bool(show_body_mesh_cb.value) if show_body_mesh_cb is not None else True
 
         if cfg.show_robots and qpos_a is not None and robot_a is not None and robot_a_root is not None and robot_dof_a is not None:
             qa = qpos_a[i]

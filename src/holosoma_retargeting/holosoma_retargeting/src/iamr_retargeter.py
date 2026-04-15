@@ -1621,8 +1621,8 @@ class IAMRRetargeter:
         for g1, g2 in candidates:
             name1 = geom_names[g1]
             name2 = geom_names[g2]
-            owner1 = self._owner_from_geom_name(name1)
-            owner2 = self._owner_from_geom_name(name2)
+            owner1 = self._owner_from_geom(g1, name1)
+            owner2 = self._owner_from_geom(g2, name2)
             if not self._is_ab_pair(owner1, owner2):
                 continue
 
@@ -1821,8 +1821,8 @@ class IAMRRetargeter:
         for g1, g2 in candidates:
             name1 = geom_names[g1]
             name2 = geom_names[g2]
-            owner1 = self._owner_from_geom_name(name1)
-            owner2 = self._owner_from_geom_name(name2)
+            owner1 = self._owner_from_geom(g1, name1)
+            owner2 = self._owner_from_geom(g2, name2)
             if not (self._is_ground_pair(owner1, owner2) or self._is_ab_pair(owner1, owner2)):
                 continue
 
@@ -1877,13 +1877,35 @@ class IAMRRetargeter:
         m.geom_margin[:] = self._saved_margins
         return candidates
 
-    def _owner_from_geom_name(self, name: str) -> str:
-        if "ground" in name.lower():
+    def _owner_from_prefixed_name(self, name: str) -> str:
+        lower = name.lower()
+        if "ground" in lower or "floor" in lower:
             return "G"
         if self.robot_a_prefix and name.startswith(self.robot_a_prefix):
             return "A"
         if self.robot_b_prefix and name.startswith(self.robot_b_prefix):
             return "B"
+        return "O"
+
+    def _owner_from_geom(self, geom_id: int, geom_name: str) -> str:
+        owner = self._owner_from_prefixed_name(geom_name)
+        if owner != "O":
+            return owner
+
+        body_id = int(self.robot_model.geom_bodyid[int(geom_id)])
+        body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        owner = self._owner_from_prefixed_name(body_name)
+        if owner != "O":
+            return owner
+
+        if int(self.robot_model.geom_type[int(geom_id)]) == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh_id = int(self.robot_model.geom_dataid[int(geom_id)])
+            if mesh_id >= 0:
+                mesh_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_MESH, mesh_id) or ""
+                owner = self._owner_from_prefixed_name(mesh_name)
+                if owner != "O":
+                    return owner
+
         return "O"
 
     @staticmethod

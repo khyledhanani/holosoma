@@ -240,6 +240,10 @@ class RobotConfig:
             return np.arange(19)
         if self.robot_type == "t1":
             return np.concatenate([np.arange(7), np.arange(11, 23)])
+        if self.robot_type == "smplx_humanoid":
+            # Track the full local qpos block by default: root translation,
+            # root orientation, and all articulated joint coordinates.
+            return np.arange(7 + self.ROBOT_DOF)
         # Default: return empty array if robot type not defined (nominal tracking not used)
         return np.array([], dtype=int)
 

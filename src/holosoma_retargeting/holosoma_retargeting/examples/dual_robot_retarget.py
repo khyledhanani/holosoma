@@ -170,8 +170,17 @@ class DualRetargetConfig:
     human_model_xml: Path = Path("models/mujoco_models/converted_model_test.xml")
     """MuJoCo XML for the articulated human model used in optimization."""
 
+    human_model_xml_a: Path | None = None
+    """Optional per-agent override for human model XML on side A."""
+
+    human_model_xml_b: Path | None = None
+    """Optional per-agent override for human model XML on side B."""
+
     human_model_height: float = 1.78
     """Nominal height for articulated human scaling in preprocessing."""
+
+    augment_human_with_hand_landmarks: bool = True
+    """If True, append Inter-X hand landmark tracks to human-target source joints when available."""
 
     data_format: str = "smplx"
     """Motion data format used for joint naming/mapping."""
@@ -269,6 +278,54 @@ def _build_q_init(human_joints: np.ndarray, robot_dof: int) -> np.ndarray:
     q_init[:3] = human_joints[0, 0, :3]  # pelvis/root position
     q_init[3] = 1.0  # identity orientation [qw, qx, qy, qz]
     return q_init
+
+
+def _load_hand_landmark_tracks(
+    sequence_dir: Path,
+    *,
+    num_frames: int,
+) -> tuple[np.ndarray | None, list[str], np.ndarray | None, list[str]]:
+    p1 = sequence_dir / "P1.npz"
+    p2 = sequence_dir / "P2.npz"
+    if not p1.exists() or not p2.exists():
+        return None, [], None, []
+
+    def _extract(path: Path) -> tuple[np.ndarray | None, list[str]]:
+        data = np.load(path, allow_pickle=True)
+        required = {"left_hand_landmarks_world", "right_hand_landmarks_world", "hand_landmark_names"}
+        if not required.issubset(set(data.files)):
+            return None, []
+        landmark_names = [str(x) for x in np.asarray(data["hand_landmark_names"]).tolist()]
+        left = np.asarray(data["left_hand_landmarks_world"], dtype=np.float32)[:num_frames]
+        right = np.asarray(data["right_hand_landmarks_world"], dtype=np.float32)[:num_frames]
+        keep_idx = [i for i, name in enumerate(landmark_names) if name.strip().lower() != "wrist"]
+        if not keep_idx:
+            return None, []
+        left = left[:, keep_idx, :]
+        right = right[:, keep_idx, :]
+        names_left = [f"L_hand_{landmark_names[i].strip().lower()}" for i in keep_idx]
+        names_right = [f"R_hand_{landmark_names[i].strip().lower()}" for i in keep_idx]
+        points = np.concatenate([left, right], axis=1)
+        return points.astype(np.float32), names_left + names_right
+
+    a_points, a_names = _extract(p1)
+    b_points, b_names = _extract(p2)
+    return a_points, a_names, b_points, b_names
+
+
+def _human_hand_landmark_mapping() -> dict[str, str]:
+    return {
+        "L_hand_index_mcp": "L_Index1",
+        "L_hand_middle_mcp": "L_Middle1",
+        "L_hand_pinky_mcp": "L_Pinky1",
+        "L_hand_index_tip": "L_Index3",
+        "L_hand_thumb_tip": "L_Thumb3",
+        "R_hand_index_mcp": "R_Index1",
+        "R_hand_middle_mcp": "R_Middle1",
+        "R_hand_pinky_mcp": "R_Pinky1",
+        "R_hand_index_tip": "R_Index3",
+        "R_hand_thumb_tip": "R_Thumb3",
+    }
 
 
 def _run_single_agent_retarget(
@@ -438,14 +495,38 @@ def _append_section_children(dst_root: ET.Element, src_root: ET.Element, section
         dst_section = dst_root.find(section_tag)
         if dst_section is None:
             dst_section = ET.SubElement(dst_root, section_tag)
+        merge_scope_idx = 0
+
+        def _new_merge_scope() -> ET.Element:
+            nonlocal merge_scope_idx
+            scope = ET.SubElement(dst_section, "default", attrib={"class": f"merged_scope_{merge_scope_idx}"})
+            merge_scope_idx += 1
+            return scope
+
         for src_section in src_sections:
+            # Preserve named defaults as nested scopes.
             if src_section.attrib:
                 nested_default = ET.SubElement(dst_section, "default", attrib=deepcopy(src_section.attrib))
                 for child in list(src_section):
                     nested_default.append(deepcopy(child))
-            else:
-                for child in list(src_section):
-                    dst_section.append(deepcopy(child))
+                continue
+
+            merge_scope: ET.Element | None = None
+            for child in list(src_section):
+                child_copy = deepcopy(child)
+                if child_copy.tag == "default":
+                    dst_section.append(child_copy)
+                    continue
+
+                # MuJoCo allows only one direct singleton tag (e.g. <geom>)
+                # per <default> scope. Collisions are moved into a classed
+                # nested scope.
+                if dst_section.find(child_copy.tag) is None:
+                    dst_section.append(child_copy)
+                else:
+                    if merge_scope is None:
+                        merge_scope = _new_merge_scope()
+                    merge_scope.append(child_copy)
         return
 
     dst_section = dst_root.find(section_tag)
@@ -527,6 +608,19 @@ def _preprocess_dual_humans_for_coupled(
     return human_a_processed, human_b_processed, foot_a, foot_b
 
 
+def _resolve_coupled_source_scales(
+    *,
+    scale_a: float,
+    scale_b: float,
+    target_mode: str,
+) -> tuple[float, float]:
+    if target_mode != "human_to_robot":
+        return scale_a, scale_b
+
+    shared_scale = 0.5 * (float(scale_a) + float(scale_b))
+    return shared_scale, shared_scale
+
+
 def _resolve_asset_paths(constants: SimpleNamespace, asset_root: Path) -> None:
     project_root = Path(__file__).resolve().parents[4]
 
@@ -573,8 +667,14 @@ def _resolve_agent_robot_types(cfg: object) -> tuple[str, str]:
     return str(robot_type_a_cfg or fallback_robot), str(robot_type_b_cfg or fallback_robot)
 
 
-def _resolve_human_model_xml(cfg: object) -> Path:
-    raw = getattr(cfg, "human_model_xml", Path("models/mujoco_models/converted_model_test.xml"))
+def _resolve_human_model_xml(cfg: object, agent: str | None = None) -> Path:
+    raw = None
+    if agent == "A":
+        raw = getattr(cfg, "human_model_xml_a", None)
+    elif agent == "B":
+        raw = getattr(cfg, "human_model_xml_b", None)
+    if raw is None:
+        raw = getattr(cfg, "human_model_xml", Path("models/mujoco_models/converted_model_test.xml"))
     p = Path(raw)
     if p.is_absolute():
         return p
@@ -599,12 +699,12 @@ def _infer_robot_dof_from_model_xml(model_xml: Path) -> int:
     return int(width - 7)
 
 
-def _apply_human_model_overrides(robot_config: RobotConfig, cfg: object) -> RobotConfig:
+def _apply_human_model_overrides(robot_config: RobotConfig, cfg: object, agent: str | None = None) -> RobotConfig:
     human_type = str(getattr(cfg, "human_model_robot_type", HUMAN_MODEL_ROBOT_TYPE))
     if robot_config.robot_type != human_type:
         return robot_config
 
-    human_xml = _resolve_human_model_xml(cfg)
+    human_xml = _resolve_human_model_xml(cfg, agent=agent)
     if not human_xml.exists():
         raise FileNotFoundError(f"Human model XML does not exist: {human_xml}")
     human_dof = _infer_robot_dof_from_model_xml(human_xml)
@@ -631,12 +731,12 @@ def _resolve_robot_and_motion_config(
     robot_config_a = robot_config_seed
     if robot_config_a.robot_type != robot_type_a:
         robot_config_a = replace(robot_config_a, robot_type=robot_type_a)
-    robot_config_a = _apply_human_model_overrides(robot_config_a, cfg)
+    robot_config_a = _apply_human_model_overrides(robot_config_a, cfg, agent="A")
 
     robot_config_b = robot_config_seed
     if robot_config_b.robot_type != robot_type_b:
         robot_config_b = replace(robot_config_b, robot_type=robot_type_b)
-    robot_config_b = _apply_human_model_overrides(robot_config_b, cfg)
+    robot_config_b = _apply_human_model_overrides(robot_config_b, cfg, agent="B")
 
     motion_data_config_a = motion_data_config_seed
     if motion_data_config_a.robot_type != robot_type_a or motion_data_config_a.data_format != data_format:
@@ -700,6 +800,28 @@ def main(cfg: DualRetargetConfig) -> None:
         human_b_retarget = _convert_y_up_to_z_up_points(human_b_retarget)
         logger.info("Applying right-handed y-up -> z-up conversion before retargeting.")
 
+    hand_extra_a: np.ndarray | None = None
+    hand_extra_b: np.ndarray | None = None
+    hand_extra_names_a: list[str] = []
+    hand_extra_names_b: list[str] = []
+    if cfg.augment_human_with_hand_landmarks:
+        sequence_dir_candidates = [
+            cfg.data_dir,
+            cfg.data_dir / sequence_id,
+            sequence_file.parent / sequence_id,
+        ]
+        sequence_dir = next((d for d in sequence_dir_candidates if d.exists() and d.is_dir()), None)
+        if sequence_dir is not None:
+            hand_extra_a, hand_extra_names_a, hand_extra_b, hand_extra_names_b = _load_hand_landmark_tracks(
+                sequence_dir,
+                num_frames=human_a_retarget.shape[0],
+            )
+            if cfg.input_y_up_to_z_up:
+                if hand_extra_a is not None:
+                    hand_extra_a = _convert_y_up_to_z_up_points(hand_extra_a)
+                if hand_extra_b is not None:
+                    hand_extra_b = _convert_y_up_to_z_up_points(hand_extra_b)
+
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     asset_root = Path(__file__).resolve().parents[1]
@@ -715,6 +837,41 @@ def main(cfg: DualRetargetConfig) -> None:
         cfg=cfg,
         asset_root=asset_root,
     )
+
+    is_human_a = robot_config_a.robot_type == cfg.human_model_robot_type
+    is_human_b = robot_config_b.robot_type == cfg.human_model_robot_type
+
+    human_a_solver = human_a_retarget
+    human_b_solver = human_b_retarget
+    human_names_a_rich: list[str] | None = None
+    human_names_b_rich: list[str] | None = None
+
+    if is_human_a and hand_extra_a is not None and hand_extra_names_a:
+        human_a_solver = np.concatenate([human_a_solver, hand_extra_a], axis=1)
+        task_constants_a.DEMO_JOINTS = list(task_constants_a.DEMO_JOINTS) + list(hand_extra_names_a)
+        task_constants_a.JOINTS_MAPPING = {
+            **dict(task_constants_a.JOINTS_MAPPING),
+            **_human_hand_landmark_mapping(),
+        }
+        human_names_a_rich = list(task_constants_a.DEMO_JOINTS)
+        logger.info(
+            "Augmented human A source with hand landmarks: base=%d + hand=%d",
+            human_a_retarget.shape[1],
+            hand_extra_a.shape[1],
+        )
+    if is_human_b and hand_extra_b is not None and hand_extra_names_b:
+        human_b_solver = np.concatenate([human_b_solver, hand_extra_b], axis=1)
+        task_constants_b.DEMO_JOINTS = list(task_constants_b.DEMO_JOINTS) + list(hand_extra_names_b)
+        task_constants_b.JOINTS_MAPPING = {
+            **dict(task_constants_b.JOINTS_MAPPING),
+            **_human_hand_landmark_mapping(),
+        }
+        human_names_b_rich = list(task_constants_b.DEMO_JOINTS)
+        logger.info(
+            "Augmented human B source with hand landmarks: base=%d + hand=%d",
+            human_b_retarget.shape[1],
+            hand_extra_b.shape[1],
+        )
 
     # Persist inspected/prepared inputs for Part 1 debugging.
     prepared_out = cfg.output_dir / f"{sequence_id}_part1_inputs.npz"
@@ -764,11 +921,24 @@ def main(cfg: DualRetargetConfig) -> None:
         )
         logger.info("Using dual scene XML: %s", dual_scene_xml)
 
-        human_a_processed, human_b_processed, foot_a, foot_b = _preprocess_dual_humans_for_coupled(
-            human_a=human_a_retarget,
-            human_b=human_b_retarget,
+        coupled_scale_a, coupled_scale_b = _resolve_coupled_source_scales(
             scale_a=scale_a,
             scale_b=scale_b,
+            target_mode=str(getattr(cfg, "target_mode", "robot_to_robot")).strip().lower(),
+        )
+        if (coupled_scale_a != scale_a) or (coupled_scale_b != scale_b):
+            logger.info(
+                "Using shared coupled source scale for interaction graph: %.4f (agent scales were %.4f / %.4f)",
+                coupled_scale_a,
+                scale_a,
+                scale_b,
+            )
+
+        human_a_processed, human_b_processed, foot_a, foot_b = _preprocess_dual_humans_for_coupled(
+            human_a=human_a_solver,
+            human_b=human_b_solver,
+            scale_a=coupled_scale_a,
+            scale_b=coupled_scale_b,
             toe_names_a=toe_names_a,
             toe_names_b=toe_names_b,
             demo_joints_a=list(task_constants_a.DEMO_JOINTS),
@@ -780,10 +950,20 @@ def main(cfg: DualRetargetConfig) -> None:
         if cfg.coupled_warm_start_nominal:
             warm_a_path = cfg.output_dir / f"{sequence_id}_A_coupled_warmstart.npz"
             warm_b_path = cfg.output_dir / f"{sequence_id}_B_coupled_warmstart.npz"
+            human_a_warmstart, human_b_warmstart, foot_a_warmstart, foot_b_warmstart = _preprocess_dual_humans_for_coupled(
+                human_a=human_a_solver,
+                human_b=human_b_solver,
+                scale_a=scale_a,
+                scale_b=scale_b,
+                toe_names_a=toe_names_a,
+                toe_names_b=toe_names_b,
+                demo_joints_a=list(task_constants_a.DEMO_JOINTS),
+                demo_joints_b=list(task_constants_b.DEMO_JOINTS),
+            )
             logger.info("Running independent warm-start retargeting for A...")
             q_nominal_a = _run_single_agent_retarget_processed(
-                human_processed=human_a_processed,
-                foot_sticking_sequences=foot_a,
+                human_processed=human_a_warmstart,
+                foot_sticking_sequences=foot_a_warmstart,
                 constants=task_constants_a,
                 retargeter_cfg=cfg.retargeter,
                 object_local_pts=object_local_pts_a,
@@ -792,8 +972,8 @@ def main(cfg: DualRetargetConfig) -> None:
             )
             logger.info("Running independent warm-start retargeting for B...")
             q_nominal_b = _run_single_agent_retarget_processed(
-                human_processed=human_b_processed,
-                foot_sticking_sequences=foot_b,
+                human_processed=human_b_warmstart,
+                foot_sticking_sequences=foot_b_warmstart,
                 constants=task_constants_b,
                 retargeter_cfg=cfg.retargeter,
                 object_local_pts=object_local_pts_b,
@@ -895,6 +1075,22 @@ def main(cfg: DualRetargetConfig) -> None:
             dual_prefix_A=cfg.dual_prefix_a,
             dual_prefix_B=cfg.dual_prefix_b,
             qpos_coordinate_frame="z_up",
+            **(
+                {
+                    "human_joints_A_rich": human_a_solver[:n],
+                    "human_joint_names_A": np.asarray(human_names_a_rich),
+                }
+                if human_names_a_rich is not None
+                else {}
+            ),
+            **(
+                {
+                    "human_joints_B_rich": human_b_solver[:n],
+                    "human_joint_names_B": np.asarray(human_names_b_rich),
+                }
+                if human_names_b_rich is not None
+                else {}
+            ),
         )
         logger.info("Saved coupled dual retarget output: %s", final_path)
         return
@@ -904,7 +1100,7 @@ def main(cfg: DualRetargetConfig) -> None:
 
     logger.info("Running independent retargeting for A (scale=%.4f)...", scale_a)
     qpos_a = _run_single_agent_retarget(
-        human_joints=human_a_retarget,
+        human_joints=human_a_solver,
         smpl_scale=scale_a,
         toe_names=toe_names_a,
         constants=task_constants_a,
@@ -916,7 +1112,7 @@ def main(cfg: DualRetargetConfig) -> None:
 
     logger.info("Running independent retargeting for B (scale=%.4f)...", scale_b)
     qpos_b = _run_single_agent_retarget(
-        human_joints=human_b_retarget,
+        human_joints=human_b_solver,
         smpl_scale=scale_b,
         toe_names=toe_names_b,
         constants=task_constants_b,
@@ -949,6 +1145,22 @@ def main(cfg: DualRetargetConfig) -> None:
         data_format_A=motion_data_config_a.data_format,
         data_format_B=motion_data_config_b.data_format,
         qpos_coordinate_frame="z_up",
+        **(
+            {
+                "human_joints_A_rich": human_a_solver[:n],
+                "human_joint_names_A": np.asarray(human_names_a_rich),
+            }
+            if human_names_a_rich is not None
+            else {}
+        ),
+        **(
+            {
+                "human_joints_B_rich": human_b_solver[:n],
+                "human_joint_names_B": np.asarray(human_names_b_rich),
+            }
+            if human_names_b_rich is not None
+            else {}
+        ),
     )
     logger.info("Saved dual Part-1 retarget output: %s", final_path)
 

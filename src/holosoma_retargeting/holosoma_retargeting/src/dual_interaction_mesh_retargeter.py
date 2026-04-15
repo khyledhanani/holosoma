@@ -112,22 +112,20 @@ class DualInteractionMeshRetargeter:
 
         self.demo_joints_a = list(self.task_constants_a.DEMO_JOINTS)
         self.demo_joints_b = list(self.task_constants_b.DEMO_JOINTS)
-        if len(self.demo_joints_a) < 22:
-            raise ValueError(
-                f"Expected at least 22 demo joints for A, got {len(self.demo_joints_a)}."
-            )
-        if len(self.demo_joints_b) < 22:
-            raise ValueError(
-                f"Expected at least 22 demo joints for B, got {len(self.demo_joints_b)}."
-            )
-        self.source_joint_names_a = self.demo_joints_a[:22]
-        self.source_joint_names_b = self.demo_joints_b[:22]
+        self.base_joint_to_link_a = dict(self.task_constants_a.JOINTS_MAPPING)
+        self.base_joint_to_link_b = dict(self.task_constants_b.JOINTS_MAPPING)
+
+        # Use all source joints that have an explicit target mapping.
+        self.source_joint_names_a = [n for n in self.demo_joints_a if n in self.base_joint_to_link_a]
+        self.source_joint_names_b = [n for n in self.demo_joints_b if n in self.base_joint_to_link_b]
+        if not self.source_joint_names_a:
+            raise ValueError("No mapped source joints found for A. Check task_constants_a.JOINTS_MAPPING.")
+        if not self.source_joint_names_b:
+            raise ValueError("No mapped source joints found for B. Check task_constants_b.JOINTS_MAPPING.")
         self.num_source_a = len(self.source_joint_names_a)
         self.num_source_b = len(self.source_joint_names_b)
         self.num_source_total = self.num_source_a + self.num_source_b
 
-        self.base_joint_to_link_a = dict(self.task_constants_a.JOINTS_MAPPING)
-        self.base_joint_to_link_b = dict(self.task_constants_b.JOINTS_MAPPING)
         self.base_foot_links_a = list(self.task_constants_a.FOOT_STICKING_LINKS)
         self.base_foot_links_b = list(self.task_constants_b.FOOT_STICKING_LINKS)
         self.robot_dof_expected_a = int(self.task_constants_a.ROBOT_DOF)
@@ -378,8 +376,8 @@ class DualInteractionMeshRetargeter:
         """Retarget a dual sequence with synchronized per-frame SQP solves.
 
         Args:
-            human_joint_motions_a: (T, 22, 3) SMPL-X joints for person A.
-            human_joint_motions_b: (T, 22, 3) SMPL-X joints for person B.
+            human_joint_motions_a: (T, Ja, 3) source joints for person A.
+            human_joint_motions_b: (T, Jb, 3) source joints for person B.
             foot_sticking_sequences_a: length-T flags for A.
             foot_sticking_sequences_b: length-T flags for B.
             q_nominal_motions_a: optional per-frame nominal states for A.
@@ -388,12 +386,14 @@ class DualInteractionMeshRetargeter:
             q_init_b: optional local robot state for B in MuJoCo order [xyz, wxyz, joints].
             dest_res_path: optional output npz path.
         """
-        if human_joint_motions_a.shape != human_joint_motions_b.shape:
-            raise ValueError(
-                f"A/B motion shape mismatch: {human_joint_motions_a.shape} vs {human_joint_motions_b.shape}"
-            )
         if human_joint_motions_a.ndim != 3 or human_joint_motions_a.shape[2] != 3:
             raise ValueError(f"Expected (T, J, 3), got {human_joint_motions_a.shape}")
+        if human_joint_motions_b.ndim != 3 or human_joint_motions_b.shape[2] != 3:
+            raise ValueError(f"Expected (T, J, 3), got {human_joint_motions_b.shape}")
+        if human_joint_motions_a.shape[0] != human_joint_motions_b.shape[0]:
+            raise ValueError(
+                f"A/B frame count mismatch: {human_joint_motions_a.shape[0]} vs {human_joint_motions_b.shape[0]}"
+            )
         if human_joint_motions_a.shape[1] < self.num_source_a:
             raise ValueError(
                 f"Expected at least {self.num_source_a} source joints for A, got {human_joint_motions_a.shape[1]}"
@@ -888,8 +888,8 @@ class DualInteractionMeshRetargeter:
         for g1, g2 in candidates:
             name1 = geom_names[g1]
             name2 = geom_names[g2]
-            owner1 = self._owner_from_geom_name(name1)
-            owner2 = self._owner_from_geom_name(name2)
+            owner1 = self._owner_from_geom(g1, name1)
+            owner2 = self._owner_from_geom(g2, name2)
 
             if not (self._is_ground_pair(owner1, owner2) or self._is_ab_pair(owner1, owner2)):
                 continue
@@ -950,14 +950,35 @@ class DualInteractionMeshRetargeter:
         m.geom_margin[:] = self._saved_margins
         return candidates
 
-    def _owner_from_geom_name(self, name: str) -> str:
+    def _owner_from_prefixed_name(self, name: str) -> str:
         ln = name.lower()
-        if "ground" in ln:
+        if "ground" in ln or "floor" in ln:
             return "G"
         if self.robot_a_prefix and name.startswith(self.robot_a_prefix):
             return "A"
         if self.robot_b_prefix and name.startswith(self.robot_b_prefix):
             return "B"
+        return "O"
+
+    def _owner_from_geom(self, geom_id: int, geom_name: str) -> str:
+        owner = self._owner_from_prefixed_name(geom_name)
+        if owner != "O":
+            return owner
+
+        body_id = int(self.robot_model.geom_bodyid[int(geom_id)])
+        body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        owner = self._owner_from_prefixed_name(body_name)
+        if owner != "O":
+            return owner
+
+        if int(self.robot_model.geom_type[int(geom_id)]) == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh_id = int(self.robot_model.geom_dataid[int(geom_id)])
+            if mesh_id >= 0:
+                mesh_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_MESH, mesh_id) or ""
+                owner = self._owner_from_prefixed_name(mesh_name)
+                if owner != "O":
+                    return owner
+
         return "O"
 
     @staticmethod
