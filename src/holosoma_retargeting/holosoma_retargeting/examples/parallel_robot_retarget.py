@@ -26,6 +26,7 @@ if str(src_root) not in sys.path:
 from holosoma_retargeting.config_types.data_type import MotionDataConfig  # noqa: E402
 from holosoma_retargeting.config_types.retargeting import ParallelRetargetingConfig  # noqa: E402
 from holosoma_retargeting.config_types.robot import RobotConfig  # noqa: E402
+from holosoma_retargeting.path_utils import resolve_portable_path  # noqa: E402
 
 # Import reusable functions from robot_retarget.py
 from holosoma_retargeting.examples.robot_retarget import (  # type: ignore[import-not-found]  # noqa: E402
@@ -34,6 +35,7 @@ from holosoma_retargeting.examples.robot_retarget import (  # type: ignore[impor
     create_task_constants,
     initialize_robot_pose,
     load_motion_data,
+    resolve_task_asset_paths,
     setup_object_data,
 )
 
@@ -177,6 +179,7 @@ def process_single_task(args):
         task_config = replace(task_config, object_dir=Path(file_path))
 
     constants = create_task_constants(robot_config, motion_data_config, task_config, task_type)
+    resolve_task_asset_paths(constants)
 
     # Load motion data
     human_joints, object_poses, smpl_scale = load_motion_data(
@@ -313,7 +316,7 @@ def main(cfg: ParallelRetargetingConfig) -> None:
     # Set defaults based on task type
     data_format: str = cfg.data_format or DEFAULT_DATA_FORMATS[task_type]
     save_dir = cfg.save_dir if cfg.save_dir is not None else Path(PARALLEL_SAVE_DIRS[task_type].format(robot=robot))
-    data_dir = cfg.data_dir
+    data_dir = resolve_portable_path(cfg.data_dir, prefer_bundle=True)
 
     os.makedirs(save_dir, exist_ok=True)
     print(f"Task type: {task_type}, Format: {data_format}")

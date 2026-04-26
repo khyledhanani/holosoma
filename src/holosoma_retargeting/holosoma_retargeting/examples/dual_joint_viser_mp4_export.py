@@ -568,7 +568,12 @@ def main(cfg: Config) -> None:
     robot_dof_a = None
     robot_dof_b = None
     if cfg.show_robots:
-        urdf_a_path, urdf_b_path = _resolve_robot_urdf_paths(cfg, qpos_npz_path, joints_b is not None)
+        urdf_a_path, urdf_b_path = _resolve_robot_urdf_paths(
+            cfg,
+            qpos_npz_path,
+            include_a=True,
+            include_b=joints_b is not None,
+        )
         robot_urdf_a = yourdfpy.URDF.load(str(urdf_a_path), load_meshes=True, build_scene_graph=True)
         robot_a_root = server.scene.add_frame("/robots/A", show_axes=False)
         robot_a = ViserUrdf(server, urdf_or_path=robot_urdf_a, root_node_name="/robots/A")

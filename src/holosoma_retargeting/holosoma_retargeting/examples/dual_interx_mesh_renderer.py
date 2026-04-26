@@ -16,6 +16,8 @@ import viser  # type: ignore[import-not-found]
 import yourdfpy  # type: ignore[import-untyped]
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
 
+from holosoma_retargeting.path_utils import resolve_portable_path
+
 
 # Right-handed y-up -> z-up coordinate transform.
 # p_new = R_YUP_TO_ZUP @ p_old
@@ -32,8 +34,8 @@ R_YUP_TO_ZUP = np.array(
 Q_YUP_TO_ZUP = np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
 
 DEFAULT_URDF_BY_ROBOT: dict[str, str] = {
-    "g1": "src/holosoma_retargeting/holosoma_retargeting/models/g1/g1_29dof.urdf",
-    "t1": "src/holosoma_retargeting/holosoma_retargeting/models/t1/t1_23dof.urdf",
+    "g1": "models/g1/g1_29dof.urdf",
+    "t1": "models/t1/t1_23dof.urdf",
 }
 
 SMPLX22_JOINT_NAMES: list[str] = [
@@ -341,7 +343,12 @@ def _load_proxy_joints_from_npz(
 ) -> tuple[np.ndarray | None, np.ndarray | None, str | None, list[str] | None, list[str] | None]:
     data = np.load(str(npz_path), allow_pickle=True)
     stride = max(1, int(frame_stride))
-    proxy_frame = _parse_coordinate_frame(data["qpos_coordinate_frame"]) if "qpos_coordinate_frame" in data else None
+    proxy_frame = None
+    for key in ("human_coordinate_frame", "joint_coordinate_frame", "coordinate_frame", "qpos_coordinate_frame"):
+        if key in data:
+            proxy_frame = _parse_coordinate_frame(data[key])
+            if proxy_frame is not None:
+                break
     joints_a_key = "human_joints_A_rich" if "human_joints_A_rich" in data else "human_joints_A"
     joints_b_key = "human_joints_B_rich" if "human_joints_B_rich" in data else "human_joints_B"
     joints_a = np.asarray(data[joints_a_key], dtype=np.float32)[::stride] if joints_a_key in data else None
@@ -778,7 +785,7 @@ def _resolve_robot_urdf_paths(
         urdf_a = cfg.robot_urdf_a or cfg.robot_urdf
         if urdf_a is None:
             urdf_a = DEFAULT_URDF_BY_ROBOT.get(robot_type_a or "", DEFAULT_URDF_BY_ROBOT["g1"])
-        urdf_a_path = Path(urdf_a)
+        urdf_a_path = resolve_portable_path(urdf_a, must_exist=True)
 
     urdf_b_path: Path | None = None
     if include_b:
@@ -786,7 +793,7 @@ def _resolve_robot_urdf_paths(
         if urdf_b is None:
             fallback = str(urdf_a_path) if urdf_a_path is not None else DEFAULT_URDF_BY_ROBOT["g1"]
             urdf_b = DEFAULT_URDF_BY_ROBOT.get(robot_type_b or "", fallback)
-        urdf_b_path = Path(urdf_b)
+        urdf_b_path = resolve_portable_path(urdf_b, must_exist=True)
 
     return urdf_a_path, urdf_b_path
 
@@ -1074,6 +1081,9 @@ def main(cfg: Config) -> None:
     if not npz_path.exists():
         raise FileNotFoundError(f"data_npz does not exist: {npz_path}")
 
+    interx_motion_root = resolve_portable_path(cfg.interx_motion_root, prefer_bundle=True)
+    smplx_model_root = resolve_portable_path(cfg.smplx_model_root, prefer_bundle=True)
+
     sequence_id_ref, fps_ref, target_frames = _load_reference_timeline(npz_path, cfg.frame_stride)
     sequence_id = cfg.sequence_id if cfg.sequence_id is not None else sequence_id_ref
     fps = float(cfg.fps_override) if cfg.fps_override is not None else float(fps_ref)
@@ -1091,8 +1101,8 @@ def main(cfg: Config) -> None:
             device = _choose_device(cfg.device)
             verts_a, verts_b, faces = _load_mesh_from_motion_folder(
                 sequence_id=sequence_id,
-                motion_root=Path(cfg.interx_motion_root),
-                model_root=Path(cfg.smplx_model_root),
+                motion_root=interx_motion_root,
+                model_root=smplx_model_root,
                 prefer_neutral_gender=cfg.prefer_neutral_gender,
                 device=device,
                 batch_size=cfg.batch_size,

@@ -24,6 +24,7 @@ if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
 
 from holosoma_retargeting.config_types.data_type import MotionDataConfig
+from holosoma_retargeting.path_utils import resolve_portable_path
 
 
 # SMPL-X 22-joint body skeleton connectivity.
@@ -119,8 +120,8 @@ R_YUP_TO_ZUP = np.array(
 Q_YUP_TO_ZUP = np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
 
 DEFAULT_URDF_BY_ROBOT: dict[str, str] = {
-    "g1": "src/holosoma_retargeting/holosoma_retargeting/models/g1/g1_29dof.urdf",
-    "t1": "src/holosoma_retargeting/holosoma_retargeting/models/t1/t1_23dof.urdf",
+    "g1": "models/g1/g1_29dof.urdf",
+    "t1": "models/t1/t1_23dof.urdf",
 }
 
 
@@ -752,7 +753,7 @@ def _resolve_robot_urdf_paths(
         urdf_a = cfg.robot_urdf_a or cfg.robot_urdf
         if urdf_a is None:
             urdf_a = DEFAULT_URDF_BY_ROBOT.get(robot_type_a or "", DEFAULT_URDF_BY_ROBOT["g1"])
-        urdf_a_path = Path(urdf_a)
+        urdf_a_path = resolve_portable_path(urdf_a, must_exist=True)
 
     urdf_b_path: Path | None = None
     if include_b:
@@ -760,7 +761,7 @@ def _resolve_robot_urdf_paths(
         if urdf_b is None:
             fallback = str(urdf_a_path) if urdf_a_path is not None else DEFAULT_URDF_BY_ROBOT["g1"]
             urdf_b = DEFAULT_URDF_BY_ROBOT.get(robot_type_b or "", fallback)
-        urdf_b_path = Path(urdf_b)
+        urdf_b_path = resolve_portable_path(urdf_b, must_exist=True)
 
     return urdf_a_path, urdf_b_path
 

@@ -33,6 +33,7 @@ from holosoma_retargeting.config_types.data_type import MotionDataConfig
 from holosoma_retargeting.config_types.retargeter import RetargeterConfig
 from holosoma_retargeting.config_types.robot import RobotConfig
 from holosoma_retargeting.config_types.task import TaskConfig
+from holosoma_retargeting.path_utils import resolve_portable_path
 from holosoma_retargeting.examples.robot_retarget import (
     build_retargeter_kwargs_from_config,
     create_task_constants,
@@ -71,6 +72,23 @@ def _convert_y_up_to_z_up_points(points: np.ndarray) -> np.ndarray:
     flat = points.reshape(-1, 3)
     converted = (R_YUP_TO_ZUP @ flat.T).T
     return converted.reshape(points.shape).astype(np.float32, copy=False)
+
+
+def _parse_coordinate_frame(value: object) -> str | None:
+    frame = str(np.asarray(value).item()).strip().lower()
+    if frame in {"y_up", "z_up"}:
+        return frame
+    return None
+
+
+def _infer_input_coordinate_frame(npz_path: Path) -> str | None:
+    data = np.load(npz_path, allow_pickle=True)
+    for key in ("human_coordinate_frame", "joint_coordinate_frame", "coordinate_frame", "qpos_coordinate_frame"):
+        if key in data:
+            frame = _parse_coordinate_frame(data[key])
+            if frame is not None:
+                return frame
+    return None
 
 
 def _attach_qpos_coordinate_metadata(npz_path: Path, coordinate_frame: str = "z_up") -> None:
@@ -622,21 +640,12 @@ def _resolve_coupled_source_scales(
 
 
 def _resolve_asset_paths(constants: SimpleNamespace, asset_root: Path) -> None:
-    project_root = Path(__file__).resolve().parents[4]
+    _ = asset_root
 
     def _to_abs(path_value: str | None) -> str | None:
         if path_value is None:
             return None
-        p = Path(path_value)
-        if p.is_absolute():
-            return str(p)
-        candidate_asset = (asset_root / p).resolve()
-        if candidate_asset.exists():
-            return str(candidate_asset)
-        candidate_project = (project_root / p).resolve()
-        if candidate_project.exists():
-            return str(candidate_project)
-        return str(candidate_asset)
+        return str(resolve_portable_path(path_value, prefer_bundle=True))
 
     constants.ROBOT_URDF_FILE = _to_abs(getattr(constants, "ROBOT_URDF_FILE", None))
     constants.OBJECT_URDF_FILE = _to_abs(getattr(constants, "OBJECT_URDF_FILE", None))
@@ -675,14 +684,7 @@ def _resolve_human_model_xml(cfg: object, agent: str | None = None) -> Path:
         raw = getattr(cfg, "human_model_xml_b", None)
     if raw is None:
         raw = getattr(cfg, "human_model_xml", Path("models/mujoco_models/converted_model_test.xml"))
-    p = Path(raw)
-    if p.is_absolute():
-        return p
-    project_root = Path(__file__).resolve().parents[4]
-    candidate_project = (project_root / p).resolve()
-    if candidate_project.exists():
-        return candidate_project
-    return (Path(__file__).resolve().parents[1] / p).resolve()
+    return resolve_portable_path(raw, prefer_bundle=True)
 
 
 def _infer_robot_dof_from_model_xml(model_xml: Path) -> int:
@@ -777,10 +779,14 @@ def _build_robot_only_task_context(
 
 
 def main(cfg: DualRetargetConfig) -> None:
+    cfg.data_dir = resolve_portable_path(cfg.data_dir, prefer_bundle=True, must_exist=True)
+    cfg.output_dir = resolve_portable_path(cfg.output_dir, prefer_bundle=True)
+
     robot_config_a, robot_config_b, motion_data_config_a, motion_data_config_b = _resolve_robot_and_motion_config(cfg)
 
     sequence_file = _pick_sequence_file(cfg.data_dir, cfg.sequence_id)
     sequence_id, fps, human_a, human_b, height_a, height_b = _load_dual_sequence(sequence_file)
+    input_coordinate_frame = _infer_input_coordinate_frame(sequence_file)
 
     if cfg.max_frames is not None:
         n = min(cfg.max_frames, human_a.shape[0])
@@ -795,10 +801,18 @@ def main(cfg: DualRetargetConfig) -> None:
 
     human_a_retarget = human_a.copy()
     human_b_retarget = human_b.copy()
-    if cfg.input_y_up_to_z_up:
+    should_convert_input = bool(cfg.input_y_up_to_z_up)
+    if should_convert_input and input_coordinate_frame == "z_up":
+        should_convert_input = False
+        logger.info(
+            "Skipping y-up -> z-up conversion because input metadata already marks human joints as z_up."
+        )
+    elif should_convert_input:
         human_a_retarget = _convert_y_up_to_z_up_points(human_a_retarget)
         human_b_retarget = _convert_y_up_to_z_up_points(human_b_retarget)
         logger.info("Applying right-handed y-up -> z-up conversion before retargeting.")
+    elif input_coordinate_frame is not None:
+        logger.info("Using input human joint coordinate frame from metadata: %s", input_coordinate_frame)
 
     hand_extra_a: np.ndarray | None = None
     hand_extra_b: np.ndarray | None = None
@@ -816,7 +830,7 @@ def main(cfg: DualRetargetConfig) -> None:
                 sequence_dir,
                 num_frames=human_a_retarget.shape[0],
             )
-            if cfg.input_y_up_to_z_up:
+            if should_convert_input:
                 if hand_extra_a is not None:
                     hand_extra_a = _convert_y_up_to_z_up_points(hand_extra_a)
                 if hand_extra_b is not None:
@@ -887,6 +901,7 @@ def main(cfg: DualRetargetConfig) -> None:
         robot_B=robot_config_b.robot_type,
         data_format_A=motion_data_config_a.data_format,
         data_format_B=motion_data_config_b.data_format,
+        **({"human_coordinate_frame": input_coordinate_frame} if input_coordinate_frame is not None else {}),
     )
     logger.info("Saved Part-1 prepared inputs: %s", prepared_out)
 
@@ -1075,6 +1090,7 @@ def main(cfg: DualRetargetConfig) -> None:
             dual_prefix_A=cfg.dual_prefix_a,
             dual_prefix_B=cfg.dual_prefix_b,
             qpos_coordinate_frame="z_up",
+            human_coordinate_frame="z_up",
             **(
                 {
                     "human_joints_A_rich": human_a_solver[:n],
@@ -1145,6 +1161,7 @@ def main(cfg: DualRetargetConfig) -> None:
         data_format_A=motion_data_config_a.data_format,
         data_format_B=motion_data_config_b.data_format,
         qpos_coordinate_frame="z_up",
+        human_coordinate_frame="z_up",
         **(
             {
                 "human_joints_A_rich": human_a_solver[:n],

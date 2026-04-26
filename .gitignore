@@ -6,6 +6,9 @@
 *.onnx
 DATA/
 models/
+!src/holosoma_retargeting/holosoma_retargeting/models/
+!src/holosoma_retargeting/holosoma_retargeting/models/mujoco_models/
+!src/holosoma_retargeting/holosoma_retargeting/models/mujoco_models/**
 SMPLSim
 
 

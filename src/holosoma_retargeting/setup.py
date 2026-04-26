@@ -6,6 +6,14 @@ setup(
     description="holosoma-retargeting: retargeting components for converting human motions to robot motions",
     author="Amazon FAR Team",
     packages=find_packages(),
+    include_package_data=True,
+    package_data={
+        "holosoma_retargeting": [
+            "models/**/*",
+            "demo_data/**/*",
+            "src/*.jsonl",
+        ],
+    },
     python_requires=">=3.10",
     install_requires=[
         # Needs to ping numpy to 2.3.5;

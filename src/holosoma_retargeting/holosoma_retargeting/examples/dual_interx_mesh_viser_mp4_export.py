@@ -45,6 +45,7 @@ from holosoma_retargeting.examples.dual_joint_viser_mp4_export import (  # noqa:
     _snapshot_client_camera,
     _wait_for_client,
 )
+from holosoma_retargeting.path_utils import resolve_portable_path  # noqa: E402
 
 
 @dataclass
@@ -203,6 +204,8 @@ def main(cfg: Config) -> None:
         npz_path,
         cfg.frame_stride,
     )
+    interx_motion_root = resolve_portable_path(cfg.interx_motion_root, prefer_bundle=True)
+    smplx_model_root = resolve_portable_path(cfg.smplx_model_root, prefer_bundle=True)
     direct_mesh = _load_direct_mesh_from_npz(npz_path=npz_path, frame_stride=cfg.frame_stride)
     mesh_available = True
     mesh_warning: str | None = None
@@ -214,8 +217,8 @@ def main(cfg: Config) -> None:
             device = _choose_device(cfg.device)
             verts_a, verts_b, faces = _load_mesh_from_motion_folder(
                 sequence_id=sequence_id,
-                motion_root=Path(cfg.interx_motion_root),
-                model_root=Path(cfg.smplx_model_root),
+                motion_root=interx_motion_root,
+                model_root=smplx_model_root,
                 prefer_neutral_gender=cfg.prefer_neutral_gender,
                 device=device,
                 batch_size=cfg.batch_size,

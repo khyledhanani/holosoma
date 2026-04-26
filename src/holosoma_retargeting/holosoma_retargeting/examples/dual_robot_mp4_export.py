@@ -19,6 +19,7 @@ from holosoma_retargeting.config_types.robot import RobotConfig  # noqa: E402
 from holosoma_retargeting.examples.dual_robot_retarget import (  # noqa: E402
     _build_dual_scene_xml_from_pair,
 )
+from holosoma_retargeting.path_utils import resolve_portable_path  # noqa: E402
 
 
 Q_YUP_TO_ZUP = np.array([np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0], dtype=np.float32)
@@ -197,9 +198,8 @@ def _load_qpos_tracks(
 
 
 def _resolve_default_robot_xml(robot_type: str) -> Path:
-    asset_root = Path(__file__).resolve().parents[1]
     robot_cfg = RobotConfig(robot_type=robot_type)
-    robot_urdf = asset_root / robot_cfg.ROBOT_URDF_FILE
+    robot_urdf = resolve_portable_path(robot_cfg.ROBOT_URDF_FILE, must_exist=True)
     robot_xml = robot_urdf.with_suffix(".xml")
     if not robot_xml.exists():
         raise FileNotFoundError(f"Robot XML not found for robot '{robot_type}': {robot_xml}")

@@ -18,6 +18,7 @@ from holosoma_retargeting.config_types.data_type import MotionDataConfig
 from holosoma_retargeting.config_types.retargeter import RetargeterConfig
 from holosoma_retargeting.config_types.robot import RobotConfig
 from holosoma_retargeting.config_types.task import TaskConfig
+from holosoma_retargeting.path_utils import resolve_portable_path
 from holosoma_retargeting.examples.dual_robot_retarget import (
     DualRetargetConfig,
     _build_robot_only_task_context,
@@ -182,6 +183,9 @@ class MixedRetargetConfig:
 
 
 def main(cfg: MixedRetargetConfig) -> None:
+    cfg.data_dir = resolve_portable_path(cfg.data_dir, prefer_bundle=True, must_exist=True)
+    cfg.output_dir = resolve_portable_path(cfg.output_dir, prefer_bundle=True)
+
     side = cfg.robot_side.upper()
     if side not in {"A", "B"}:
         raise ValueError(f"robot_side must be 'A' or 'B', got {cfg.robot_side!r}")

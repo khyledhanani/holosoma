@@ -26,6 +26,7 @@ from holosoma_retargeting.config_types.retargeter import RetargeterConfig  # noq
 from holosoma_retargeting.config_types.retargeting import RetargetingConfig  # noqa: E402
 from holosoma_retargeting.config_types.robot import RobotConfig  # noqa: E402
 from holosoma_retargeting.config_types.task import TaskConfig  # noqa: E402
+from holosoma_retargeting.path_utils import resolve_portable_path  # noqa: E402
 from holosoma_retargeting.src.interaction_mesh_retargeter import (  # noqa: E402
     InteractionMeshRetargeter,  # type: ignore[import-not-found]
 )
@@ -129,6 +130,21 @@ def create_task_constants(
         task_constants.SCENE_XML_FILE = ""  # Will be set later
 
     return task_constants
+
+
+def resolve_task_asset_paths(task_constants: SimpleNamespace) -> None:
+    """Resolve robot/object asset paths against cwd and package roots."""
+
+    def _resolve(path_value: str | None, *, prefer_bundle: bool = False) -> str | None:
+        if path_value is None:
+            return None
+        return str(resolve_portable_path(path_value, prefer_bundle=prefer_bundle))
+
+    task_constants.ROBOT_URDF_FILE = _resolve(getattr(task_constants, "ROBOT_URDF_FILE", None))
+    task_constants.OBJECT_URDF_FILE = _resolve(getattr(task_constants, "OBJECT_URDF_FILE", None))
+    task_constants.OBJECT_MESH_FILE = _resolve(getattr(task_constants, "OBJECT_MESH_FILE", None))
+    if hasattr(task_constants, "SCENE_XML_FILE"):
+        task_constants.SCENE_XML_FILE = _resolve(getattr(task_constants, "SCENE_XML_FILE", None))
 
 
 def validate_config(cfg: RetargetingConfig) -> None:
@@ -611,7 +627,7 @@ def main(cfg: RetargetingConfig) -> None:
     # Set defaults based on task type
     data_format: str = cfg.data_format or DEFAULT_DATA_FORMATS[task_type]
     save_dir = cfg.save_dir if cfg.save_dir is not None else Path(DEFAULT_SAVE_DIRS[task_type].format(robot=robot))
-    data_path = cfg.data_path
+    data_path = resolve_portable_path(cfg.data_path, prefer_bundle=True)
 
     os.makedirs(save_dir, exist_ok=True)
     logger.info("Task: %s, Type: %s, Format: %s", task_name, task_type, data_format)
@@ -636,6 +652,7 @@ def main(cfg: RetargetingConfig) -> None:
         task_config=cfg.task_config,
         task_type=task_type,
     )
+    resolve_task_asset_paths(constants)
 
     # Load motion data
     human_joints, object_poses, smpl_scale = load_motion_data(

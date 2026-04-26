@@ -20,6 +20,7 @@ if str(src_root) not in sys.path:
 from holosoma_retargeting.config_types.data_conversion import DataConversionConfig  # noqa: E402
 from holosoma_retargeting.config_types.data_type import MotionDataConfig  # noqa: E402
 from holosoma_retargeting.config_types.robot import RobotConfig  # noqa: E402
+from holosoma_retargeting.path_utils import resolve_portable_path  # noqa: E402
 
 DynamicState = Tuple[
     torch.Tensor,
@@ -75,6 +76,18 @@ def create_task_constants(
         namespace.SCENE_XML_FILE = namespace.ROBOT_URDF_FILE.replace(".urdf", ".xml")
 
     return namespace
+
+
+def _resolve_task_asset_paths(constants: SimpleNamespace) -> None:
+    def _resolve(path_value: str | None, *, prefer_bundle: bool = False) -> str | None:
+        if path_value is None:
+            return None
+        return str(resolve_portable_path(path_value, prefer_bundle=prefer_bundle))
+
+    constants.ROBOT_URDF_FILE = _resolve(getattr(constants, "ROBOT_URDF_FILE", None))
+    constants.OBJECT_URDF_FILE = _resolve(getattr(constants, "OBJECT_URDF_FILE", None))
+    constants.OBJECT_MESH_FILE = _resolve(getattr(constants, "OBJECT_MESH_FILE", None))
+    constants.SCENE_XML_FILE = _resolve(getattr(constants, "SCENE_XML_FILE", None))
 
 
 def quat_conjugate(q):  # (...,4) [w,x,y,z]
@@ -349,8 +362,9 @@ def run_simulator(args_cli: DataConversionConfig):
     has_dynamic_object = args_cli.has_dynamic_object
     use_omniretarget_data = args_cli.use_omniretarget_data
     line_range: tuple[int, int] | None = args_cli.line_range
+    input_file = str(resolve_portable_path(args_cli.input_file, prefer_bundle=True, must_exist=True))
     motion = MotionLoader(
-        motion_file=args_cli.input_file,
+        motion_file=input_file,
         input_fps=args_cli.input_fps,
         output_fps=args_cli.output_fps,
         device=device,
@@ -384,6 +398,7 @@ def run_simulator(args_cli: DataConversionConfig):
         motion_config,
         object_name=object_name,
     )
+    _resolve_task_asset_paths(constants)
 
     # Load Mujoco model
     object_name = constants.OBJECT_NAME

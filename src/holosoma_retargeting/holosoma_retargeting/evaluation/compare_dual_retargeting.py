@@ -26,6 +26,7 @@ from holosoma_retargeting.config_types.data_type import MotionDataConfig
 from holosoma_retargeting.config_types.retargeter import RetargeterConfig
 from holosoma_retargeting.config_types.robot import RobotConfig
 from holosoma_retargeting.config_types.task import TaskConfig
+from holosoma_retargeting.path_utils import resolve_portable_path
 from holosoma_retargeting.evaluation.eval_retargeting import (
     RetargetingEvaluator,
     create_task_constants,
@@ -470,6 +471,12 @@ def _json_default(value: Any) -> Any:
 
 
 def main(cfg: CompareDualRetargetingConfig) -> None:
+    cfg.data_dir = resolve_portable_path(cfg.data_dir, prefer_bundle=True, must_exist=True)
+    cfg.raw_interx_dir = resolve_portable_path(cfg.raw_interx_dir, prefer_bundle=True, must_exist=True)
+    cfg.output_root = resolve_portable_path(cfg.output_root, prefer_bundle=True)
+    if cfg.sequence_ids_file is not None:
+        cfg.sequence_ids_file = resolve_portable_path(cfg.sequence_ids_file, prefer_bundle=True, must_exist=True)
+
     if cfg.robot not in TOE_BODY_NAMES:
         raise ValueError(f"Unsupported robot for sliding metrics: {cfg.robot}")
 

@@ -29,6 +29,7 @@ from holosoma_retargeting.config_types.data_type import (  # noqa: E402
     MotionDataConfig,
 )
 from holosoma_retargeting.config_types.robot import RobotConfig  # noqa: E402
+from holosoma_retargeting.path_utils import resolve_portable_path  # noqa: E402
 from holosoma_retargeting.src.mujoco_utils import _world_mesh_from_geom  # type: ignore[import-not-found]  # noqa: E402
 from holosoma_retargeting.src.utils import (  # type: ignore[import-not-found]  # noqa: E402
     calculate_scale_factor,
@@ -81,6 +82,16 @@ def create_task_constants(
         namespace.OBJECT_DIR = object_dir
         namespace.OBJECT_URDF_FILE = f"{object_dir}/{namespace.OBJECT_NAME}.urdf"
         namespace.OBJECT_MESH_FILE = f"{object_dir}/{namespace.OBJECT_NAME}.obj"
+
+    def _resolve(path_value: str | None, *, prefer_bundle: bool = False) -> str | None:
+        if path_value is None:
+            return None
+        return str(resolve_portable_path(path_value, prefer_bundle=prefer_bundle))
+
+    namespace.ROBOT_URDF_FILE = _resolve(getattr(namespace, "ROBOT_URDF_FILE", None))
+    namespace.OBJECT_URDF_FILE = _resolve(getattr(namespace, "OBJECT_URDF_FILE", None))
+    namespace.OBJECT_MESH_FILE = _resolve(getattr(namespace, "OBJECT_MESH_FILE", None))
+    namespace.SCENE_XML_FILE = _resolve(getattr(namespace, "SCENE_XML_FILE", None))
 
     return namespace
 
@@ -743,6 +754,9 @@ class Args:
 
 
 def main(cfg: Args) -> None:
+    cfg.res_dir = resolve_portable_path(cfg.res_dir, prefer_bundle=True, must_exist=True)
+    cfg.data_dir = resolve_portable_path(cfg.data_dir, prefer_bundle=True, must_exist=True)
+
     default_data_formats = {
         "robot_object": "smplh",
         "robot_only": "smplh",

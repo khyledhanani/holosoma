@@ -16,6 +16,7 @@ src_root = Path(__file__).resolve().parent.parent
 if str(src_root) not in sys.path:
     sys.path.insert(0, str(src_root))
 from holosoma_retargeting.config_types.viser import ViserConfig  # noqa: E402
+from holosoma_retargeting.path_utils import resolve_portable_path  # noqa: E402
 from holosoma_retargeting.src.viser_utils import create_motion_control_sliders  # noqa: E402
 
 
@@ -48,13 +49,16 @@ def make_player(
     robot_root = server.scene.add_frame("/robot", show_axes=False)
     object_root = server.scene.add_frame("/object", show_axes=False)
 
+    robot_urdf_path = resolve_portable_path(config.robot_urdf, must_exist=True)
+
     # URDFs (using yourdfpy so meshes show up)
-    robot_urdf_y = yourdfpy.URDF.load(config.robot_urdf, load_meshes=True, build_scene_graph=True)
+    robot_urdf_y = yourdfpy.URDF.load(str(robot_urdf_path), load_meshes=True, build_scene_graph=True)
     vr = ViserUrdf(server, urdf_or_path=robot_urdf_y, root_node_name="/robot")
 
     vo = None
     if config.object_urdf:
-        object_urdf_y = yourdfpy.URDF.load(config.object_urdf, load_meshes=True, build_scene_graph=True)
+        object_urdf_path = resolve_portable_path(config.object_urdf, must_exist=True)
+        object_urdf_y = yourdfpy.URDF.load(str(object_urdf_path), load_meshes=True, build_scene_graph=True)
         vo = ViserUrdf(server, urdf_or_path=object_urdf_y, root_node_name="/object")
 
     # A tiny grid
@@ -107,7 +111,8 @@ def make_player(
 
 def main(cfg: ViserConfig) -> None:
     """Main function for viser player."""
-    qpos, fps = load_npz(cfg.qpos_npz)
+    qpos_path = resolve_portable_path(cfg.qpos_npz, prefer_bundle=True, must_exist=True)
+    qpos, fps = load_npz(str(qpos_path))
     make_player(
         config=cfg,
         qpos=qpos,

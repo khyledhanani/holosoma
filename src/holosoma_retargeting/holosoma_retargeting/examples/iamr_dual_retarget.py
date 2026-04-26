@@ -39,6 +39,7 @@ from holosoma_retargeting.config_types.data_type import MotionDataConfig
 from holosoma_retargeting.config_types.retargeter import RetargeterConfig
 from holosoma_retargeting.config_types.robot import RobotConfig
 from holosoma_retargeting.config_types.task import TaskConfig
+from holosoma_retargeting.path_utils import resolve_portable_path
 from holosoma_retargeting.examples.dual_robot_retarget import (
     _build_dual_scene_xml_from_pair,
     _build_robot_only_task_context,
@@ -220,6 +221,13 @@ def _load_smplx_poses(
 
 
 def main(cfg: IAMRRetargetConfig) -> None:
+    cfg.data_dir = resolve_portable_path(cfg.data_dir, prefer_bundle=True, must_exist=True)
+    cfg.output_dir = resolve_portable_path(cfg.output_dir, prefer_bundle=True)
+    if cfg.raw_interx_dir is not None:
+        cfg.raw_interx_dir = resolve_portable_path(cfg.raw_interx_dir, prefer_bundle=True, must_exist=True)
+    if cfg.dual_scene_xml is not None:
+        cfg.dual_scene_xml = resolve_portable_path(cfg.dual_scene_xml, prefer_bundle=True)
+
     robot_cfg_a, robot_cfg_b, motion_cfg_a, motion_cfg_b = (
         _resolve_robot_and_motion_config(cfg)
     )
